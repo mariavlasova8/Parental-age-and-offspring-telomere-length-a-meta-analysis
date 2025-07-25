@@ -1,0 +1,1746 @@
+---
+  title: "meta"
+author: "Mariia Vlasova, Yuheng Sun, Janet Chik"
+date: "`r Sys.Date()`"
+output: html_document
+editor_options: 
+  markdown: 
+  wrap: 72
+---
+
+```{r setup}
+knitr::opts_chunk$set(echo = FALSE,
+                      results = 'hide',
+                      warning = FALSE,
+                      message = FALSE,
+                      include = FALSE)
+```
+
+# Intro
+
+```{r}
+#install_github("elizagrames/litsearchr", ref="main",force = TRUE)
+
+pacman::p_load(devtools,remotes, BiocManager, ggplot2, ggpubr, patchwork, GGally, magrittr, dplyr, tidyverse, openxlsx, tidylog, broom, broom.mixed, metafor, MuMIn, parallel, orchaRd, rotl, ape, ggtree, svglite, easystats, report, performance, tinytable, modelsummary, emmeans, ggsignif)
+options(scipen = 999)
+options(digits = 10)
+```
+
+# Litsearchr
+
+## Get keywords from litsearchr
+
+```{r}
+# Import naive search results (from (ALL=("parental age" AND "offspring" AND "telomere length" ) AND DT=(Article)))
+naive <- litsearchr::import_results(file="savedrecs.ris")
+
+# Extract keywords from Keywords, Titles, Abstracts
+keywords <- litsearchr::extract_terms(keywords = naive[, "keywords"],
+                                      method = "tagged",
+                                      min_n = 1)
+titles <- litsearchr::extract_terms(text = naive[, "title"],
+                                    method = "fakerake",
+                                    min_freq = 3, min_n = 1)
+abstracts <- litsearchr::extract_terms(text=naive[, "abstract"],
+                                       method="fakerake",
+                                       min_freq=3, min_n=1)
+# combine all
+naive <- unique(c(keywords,titles,abstracts))
+capture.output(naive, file = "naive.txt")
+```
+
+Selected and grouped search terms manually from the file
+
+```{r}
+# Check if the full-term search contains all selected as GS articls (titles cleaned to keep only letters)
+full_search <- litsearchr::import_results(file="871savedrecs.ris") %>% 
+  mutate(title_clean = tolower(trimws(gsub("<.*?>", "", title)))) %>% 
+  mutate(title_clean = gsub("[^a-z0-9\\s-]", "", title_clean))
+
+GSarticles <- litsearchr::import_results(file="articles.ris") %>% 
+  mutate(title_clean = tolower(trimws(gsub("<.*?>", "", title)))) %>% 
+  mutate(title_clean = gsub("[^a-z0-9\\s-]", "", title_clean)) %>% 
+  mutate(in_new_results = title_clean %in% full_search$title_clean)
+
+# none are missing
+GSarticles %>% filter(!in_new_results) %>% select(title)
+```
+
+# Meta-analysis
+
+## Import and convert data
+
+```{r}
+
+d <- read.csv("MV_meta.csv", header = TRUE, skip = 1) %>%
+  mutate(year = as.numeric(format(as.Date(PubDate, format = "%Y-%m-%d"), "%Y")), year.c = scale(year, scale = FALSE),
+         across(c(year,ParSex, OffSex, Species, SpermProdSeason, Tissue, MethFact, OffAgeTL, W_B_PEff, EnvEff, EnvCond, MF_ID), as.factor),
+         Tissue = fct_other(Tissue, keep = c("Leucocytes", "Erythrocytes"))) # put all tissues that are not Leukocytes or Erythrocytes to "Other" #, Method = ifelse(MethFact %in% c("TFR", "qPCR"), MethFact, "Other")
+d <- droplevels(d[!d$EnvCond == "Captive",]) # drop Salmon study since it's only one "captive"
+
+# Transform data to escalc to use with models from metafor
+dd <- escalc(measure = "ZCOR", # Fisher's r-to-z transformed correlation coefficient
+             ri = CorCoefCorrected, # ri, vector with the raw correlation coefficients
+             ni = n_obs, # ni, the corresponding sample sizes, here n_obs
+             var.names=c("Zr","ZrVar"),
+             data = d)
+
+# This results in a dataframe with two added columns: Zr, which is the vector with the observed effect sizes (so r-to-z) and ZrVar, which is the vector with the corresponding sampling variances
+
+dd <- dd %>% mutate(ZrSE = sqrt(ZrVar)) # Zr standard error = square root of the sampling variance
+
+meanzr <- mean(dd$Zr)
+sdzr <- sd(dd$Zr)
+minzr <- min(dd$Zr)
+maxzr <- max(dd$Zr)
+```
+
+```{r}
+# "Construct variance-covariance matrix of dependent sampling errors of effect sizes (i.e., the V matrix in rma.mv)"
+V = vcalc(vi = ZrVar, cluster = StudyID, data=dd)
+```
+
+```{r}
+report(dd$Zr)
+```
+
+```{r}
+#sessionInfo()
+#report(sessionInfo())
+# report_packages(include_R = FALSE)
+# cite_packages(prefix = "> ")
+#report_system()
+```
+
+
+## M0. Global intercept model
+
+```{r echo=T}
+m0 <- rma(Zr,ZrVar,
+          data = dd, method = "ML", slab=paste(Author.s., sep=", "))
+summary(m0)
+```
+
+What is Zr adjusted for study, estimate, phylogeny?
+```{r}
+rma.mv(Zr, ZrVar, random = list(~1|StudyID, ~1|EstimateID, ~1|Phylogeny),
+                 R = list(Phylogeny = PhyloMatrix),
+                 data = dd, method = "ML") # -0.0682
+```
+
+### Histogram of Fisher z transformed correlation coefficient
+
+```{r, echo=T}
+#Fisher's z transformed correlation coefficient histogram
+histZr <- ggplot(data = dd, aes(x = Zr))+
+  geom_histogram(binwidth = 0.05, colour = "black", fill = "grey90") +
+  geom_vline(xintercept = meanzr, linetype = "dashed", linewidth = 0.75, colour = "purple") +
+  geom_vline(xintercept = -0.0682, linetype = "dashed", linewidth = 0.75, colour = "seagreen",show.legend=F) + #xintercept = -0.0682 is Zr adjusted for study, estimateID, phylogeny
+  xlab("Fisher's z transformed correlation coefficient") +
+  ylab("Frequency") +
+  scale_x_continuous(breaks = seq(-1, 1, 0.1)) +
+  scale_y_continuous(breaks = seq(0,40,5), limits = c(0,37), expand = c(0,0)) +
+  theme(plot.margin = margin(0.5, 0.5, 0.5, 0.5, "cm"),
+        
+        panel.background = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        
+        axis.ticks = element_line(colour = "black"),
+        axis.line = element_line(colour = "black"),
+        
+        axis.text.x = element_text(size = 10,family = "Arial", colour = "black", margin=margin(t=5)),
+        axis.text.y = element_text(size = 10, family = "Arial", colour = "black"),
+        axis.title.x = element_text(size = 12, family = "Arial", colour = "black",margin=margin(t=10)),
+        axis.title.y = element_text(size = 12, family = "Arial", colour = "black",margin=margin(r=10)))
+histZr
+ggsave(histZr, filename = "histZr.svg", bg = "white", width=(20*(6/7)), height=(20*(3/7)), units = c("cm"))
+```
+
+
+### Forest plot of the individual estimates
+
+```{r}
+svglite::svglite(filename="forestplot.svg", width = 10, height = 30,
+                 pointsize = 14, bg = "white")
+
+par(tck=-0.01, mgp=c(2.5,0.5,0), mar=c(5,0,0,0))
+forest(m0, order="obs", shade="zebra",
+       alim = c(-3,4), at=seq(-1,1, by=0.25),
+       efac=c(0,1,1), col="black", psize=0.75, cex=0.65, # added diamond
+       cex.lab=1, #x-axis title
+       cex.axis=1, #x-axis labels
+       lty=c("solid","blank"), # remove horizontal line at top of plot
+       xlim=c(-2,1.5), # adjust horizontal plot region limits
+       header="Author(s) and Year")
+dev.off()
+```
+
+### Forest plot with aggregated values
+
+```{r}
+agg <- aggregate(dd, cluster=StudyID, V=vcov(m0, type="obs"), addk=TRUE)
+m_agg <- rma(Zr, ZrVar, data = agg, method = "ML", slab=paste(Author.s., sep=", "))
+
+svglite::svglite(filename="forestplotagg.svg", width = 12, height = 16, pointsize = 16, bg = "transparent")
+
+forest(m_agg, xlim=c(-3,2), mlab="Pooled Estimate", header="Author(s) and Year",
+       shade="zebra", lty=c("solid","blank"),
+       alim = c(-3,4), at=seq(-1,1, by=0.25), order="obs",
+       efac=c(0,1,1), col="black", psize=0.75,
+       fonts = "Arial",
+       cex=1,
+       cex.lab=1, #x-axis title
+       cex.axis=1, #x-axis labels
+       ilab=ki,ilab.xpos=-1.5)
+text(-1.5, m_agg$k+2.1, c("Estimates"), cex=1, font=2)
+dev.off()
+```
+
+### Forest plot with phylogenetic tree
+
+```{r}
+MSp <- rma.mv(Zr,ZrVar,
+              mods = ~ Phylogeny -1,
+              random = list(~ 1|StudyID, ~1|EstimateID),
+              data = dd, method = "REML")
+MSp
+
+dd = dd %>% mutate(CommonName = case_when(
+    Species == "Meles meles" ~ "European badger",
+    Species == "Acrocephalus sechellensis" ~ "Seychelles warbler",
+    Species == "Homo sapiens" ~ "Human",
+    Species == "Ovis aries" ~ "Domestic sheep",
+    Species == "Lacerta agilis" ~ "Sand lizard",
+    Species == "Sterna hirundo" ~ "Common tern",
+    Species == "Gulosus aristotelis" ~ "European shag",
+    Species == "Tachymarptis melba" ~ "Alpine swift",
+    Species == "Acrocephalus arundinaceus" ~ "Great reed warbler",
+    Species == "Plocepasser mahali" ~ "White-browed sparrow-weaver",
+    Species == "Corvus monedula" ~ "Western jackdaw",
+    Species == "Passer domesticus" ~ "House sparrow",
+    Species == "Pagodroma nivea" ~ "Snow petrel",
+    TRUE ~ "Other"))
+
+#Format phylogenetic tree
+CommonNames <- unique(dd[c("Species", "CommonName")])
+CommonNames$NewTipLabels <- paste(CommonNames$CommonName, " (", CommonNames$Species, ")", sep = "")
+PhyloForPlot <- PhyloBrLen
+PhyloForPlot$tip.label <- CommonNames$NewTipLabels[match(gsub("_", " ",PhyloBrLen$tip.label), CommonNames$Species)]
+plot(PhyloForPlot)
+
+#Data frame for plotting
+CommonNames <- CommonNames[order(CommonNames$Species),]
+Zrs <- MSp$b[1:13]
+SpLower <- MSp$ci.lb[1:13]
+SpUpper <- MSp$ci.ub[1:13]
+SpDF <- data.frame(CommonNames$NewTipLabels,Zrs,SpLower,SpUpper, row.names = NULL)
+SpDF$CommonNames.NewTipLabels <- factor(SpDF$CommonNames.NewTipLabels)
+
+#Coloured tree (%<+% from ggtree)
+tree <- ggtree(PhyloForPlot, ladderize = FALSE, size = 1.5, aes(color = Zrs)) %<+% SpDF +
+  scale_color_continuous(low="darkslategrey", high="palegreen",
+                         breaks = c(-0.7, -0.5, -0.25, 0, 0.25)) + 
+  geom_tiplab(as_ylab=TRUE) +
+  theme(legend.position="bottom",
+        axis.text.y = element_text(size = 12, colour = "black")) +
+  guides(color = guide_colorbar(title = "Zr", title.position = "left", title.vjust = 0.9)) +
+  theme(legend.direction = "horizontal",
+        legend.position = "bottom",
+        legend.key.height = unit(0.5, "cm"),
+        legend.key.width = unit(1.5, "cm")) 
+tree
+ggsave(tree, filename = "Tree.svg",  bg = "white", width = 8, height = 5)
+```
+
+```{r}
+#Forest plot
+SpDF$CommonNames.NewTipLabels <- factor(SpDF$CommonNames.NewTipLabels,
+                                        levels = rev(c("Sand lizard (Lacerta agilis)",
+                                                   "Alpine swift (Tachymarptis melba)",
+                                                   "Snow petrel (Pagodroma nivea)",
+                                                   "European shag (Gulosus aristotelis)",
+                                                   "Common tern (Sterna hirundo)",
+                                                   "Western jackdaw (Corvus monedula)",
+                                                   "Seychelles warbler (Acrocephalus sechellensis)",
+                                                   "Great reed warbler (Acrocephalus arundinaceus)",
+                                                   "House sparrow (Passer domesticus)",
+                                                   "White-browed sparrow-weaver (Plocepasser mahali)",
+                                                   "European badger (Meles meles)",
+                                                   "Domestic sheep (Ovis aries)",
+                                                   "Human (Homo sapiens)")))
+
+SpForest <- ggplot(data = SpDF,
+                   aes(x = CommonNames.NewTipLabels, y = Zrs, ymin = SpLower, ymax = SpUpper)) +
+  geom_pointrange(linewidth = 0.25, fatten = 5, shape=15) + 
+  geom_hline(yintercept = 0, lty = 2) +
+  geom_hline(yintercept = -0.0682, lty = 1) + # -0.0682 is mean-adjusted Zr like in histogram
+  coord_flip() +  # flip coordinates (puts labels on y axis)
+  scale_y_continuous(limits = c(-1,1), breaks = seq(-1, 1, by = 0.25)) +
+  ylab("Zr (95% CI)") +
+  theme(panel.background = element_rect(fill = "transparent"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        plot.background = element_rect(fill = "transparent"),
+        axis.title.y = element_blank(),
+        axis.title.x = element_text(colour = "black", margin = margin(t = 20)),
+        axis.line.x = element_line(colour = "black"),
+        axis.text.x = element_text(colour = "black"),
+        axis.line.y = element_blank(),
+        axis.text.y = element_blank(), # don't display species names
+        axis.ticks.y = element_blank())
+SpForest
+ggsave(SpForest, filename = "SpForest.svg",  bg = "transparent", width = 4, height = 4)
+```
+
+```{r}
+#svglite::svglite(filename="Tree-SpForest.svg", width = 12, height = 5, pointsize = 12, bg = "transparent")
+#ggarrange(tree, SpForest, ncol = 2, nrow = 1, widths = c(2,1), align = "h")
+#dev.off()
+
+Tree_SpForest <- ggarrange(tree, SpForest, ncol = 2, align = "v", heights = c(1, 1))
+ggsave("Tree-SpForest.svg", Tree_SpForest, width = 45, height = 15, units = "cm")
+```
+## M1. All random effects to account for non-independence among studies but no moderators yet
+
+### Phylogeny
+```{r message=FALSE, warning=FALSE}
+#Phylogeny
+#Get phyl names from species
+Names <- tnrs_match_names(dd$Species) # "rotl"
+
+# Construct phylogenetic tree
+Phylo <- tol_induced_subtree(ott_ids = Names$ott_id, label_format = "name") # "rotl"
+plot(Phylo, no.margin = TRUE)
+save(Phylo, file = "PhyloNew.Rdata")
+
+# Create phylogenetic variance-covariance matrix
+PhyloBrLen <- compute.brlen(Phylo) # "ape"
+PhyloMatrix <- vcv(PhyloBrLen, corr = TRUE)
+save(PhyloMatrix, file = "PhyloMatrixNew.Rdata")
+#load("~/meta/code/project/PhyloMatrixNew.Rdata")
+```
+
+```{r,echo=T}
+m1 <- rma.mv(Zr, ZrVar, random = list(~1|StudyID, ~1|EstimateID, ~1|Phylogeny),
+                 R = list(Phylogeny = PhyloMatrix),
+                 data = dd, method = "ML")
+summary(m1)
+tidy(m1, conf.int = T)
+```
+
+### Check whether random effects are normally distributed through Q-Q plot for residuals
+
+```{r}
+residuals <- residuals(m1)
+fitted <- fitted(m1)
+qqnorm(residuals, main = "Q-Q Plot of Residuals")
+qqline(residuals, col = "red")
+```
+
+### Get LRT of each random effect by comparing reduced model to full model with anova
+
+```{r}
+LRT_study = rma.mv(Zr,ZrVar, random = list(~1|EstimateID, ~1|Phylogeny),R = list(Phylogeny = PhyloMatrix), method = "ML", data = dd)
+LRT_estimate = rma.mv(Zr,ZrVar, random = list(~1|StudyID, ~1|Phylogeny),R = list(Phylogeny = PhyloMatrix), method = "ML", data = dd)
+LRT_phylogeny = rma.mv(Zr,ZrVar, random = list(~1|StudyID, ~1|EstimateID),method = "ML", data = dd)
+
+anova(m1, LRT_study) # 23.5825 (<0.0001)
+anova(m1, LRT_estimate) # 219.2224 (<0.0001)
+anova(m1, LRT_phylogeny) # 13.0762 (0.0003)
+```
+
+Large LRT with a small p-value: factor significantly contributes to the model, keep the it in the model.
+
+### Test which random effects to add to the models by comparing AIC, BIC, logLik in all combinations of random effects
+
+```{r}
+re <- list(
+st = rma.mv(Zr,ZrVar, random = ~1|StudyID, method = "ML", data = dd),
+st.est = rma.mv(Zr,ZrVar, random = list(~1|StudyID, ~1|EstimateID),method = "ML", data = dd),
+st.sp = rma.mv(Zr,ZrVar, random = list(~1|StudyID, ~1|Species),method = "ML", data = dd),
+st.ph = rma.mv(Zr,ZrVar, random = list(~1|StudyID, ~1|Phylogeny),R = list(Phylogeny = PhyloMatrix),method = "ML", data = dd),
+est = rma.mv(Zr,ZrVar, random = ~1|EstimateID,method = "ML", data = dd),
+est.sp = rma.mv(Zr,ZrVar, random = list(~1|EstimateID, ~1|Species),method = "ML", data = dd),
+est.ph = rma.mv(Zr,ZrVar, random = list(~1|EstimateID, ~1|Phylogeny),R = list(Phylogeny = PhyloMatrix), method = "ML", data = dd),
+sp = rma.mv(Zr,ZrVar, random = ~1|Species,method = "ML", data = dd),
+sp.ph = rma.mv(Zr,ZrVar, random = list(~1|Species, ~1|Phylogeny),R = list(Phylogeny = PhyloMatrix),method = "ML", data = dd),
+ph = rma.mv(Zr,ZrVar, random = ~1|Phylogeny,R = list(Phylogeny = PhyloMatrix),method = "ML", data = dd),
+st.est.sp = rma.mv(Zr,ZrVar, random = list(~1|StudyID, ~1|EstimateID, ~1|Species), method = "ML", data = dd),
+st.sp.ph = rma.mv(Zr,ZrVar, random = list(~1|StudyID, ~1|Species, ~1|Phylogeny),R = list(Phylogeny = PhyloMatrix), method = "ML", data = dd),
+st.est.ph = rma.mv(Zr,ZrVar, random = list(~1|StudyID, ~1|EstimateID, ~1|Phylogeny),R = list(Phylogeny = PhyloMatrix), method = "ML", data = dd),
+sp.est.ph = rma.mv(Zr,ZrVar, random = list(~1|Species, ~1|EstimateID, ~1|Phylogeny),R = list(Phylogeny = PhyloMatrix), method = "ML", data = dd),
+st.est.sp.ph = rma.mv(Zr,ZrVar, random = list(~1|StudyID, ~1|EstimateID, ~1|Species, ~1|Phylogeny),R = list(Phylogeny = PhyloMatrix),method = "ML", data = dd))
+
+#Model comparison
+random_eff <- data.frame(AIC = sapply(re, AIC),
+                         BIC = sapply(re, BIC),
+                         logLik = sapply(re, logLik))
+random_eff[order(random_eff$AIC), ]
+```
+
+est.sp, est.ph, st.est.sp, st.est.ph, sp.est.ph, st.est.sp.ph AIC values are good. I will be using st.est.ph in the meta-regression to account for all random effects, as they are all important for the study question
+
+### Variance components for each random effect [sigma\^2], 95% confidence intervals (CIs) + proportion heterogeneity each variance component explains
+
+Lower bound of the variance estimates cannot be negative since variance (sigma\^2) must always be zero or positive. So if CI includes zero, it means the variance component is not significantly different from zero + little evidence for variability among the estimates
+
+```{r}
+confint_m1 <- confint(m1)
+confint_m1
+
+#### From 10.1007/s10682-012-9555-5 and 10.1111/jeb.14071
+
+wj <- 1/dd$ZrVar # wj is weight (inverse of sampling variance) of jth size
+s2m <- sum(wj)*(length(unique(dd$StudyID)-1))/((sum(wj))^2-sum(wj^2)) #s2m is within-study variance, typical sampling error
+m1.s2t <- sum(m1$sigma2)+s2m #Total variance, eq23
+
+m1I2total <- sum(m1$sigma2)/m1.s2t #I\^2 total: 0.9963593738
+m1I2Study <- m1$sigma2[1]/m1.s2t # I\^2 for StudyID: 0.1517161853
+m1I2Estimate <- m1$sigma2[2]/m1.s2t # I\^2 for EstimateID: 0.06139386308
+m1I2Phylogeny <- m1$sigma2[3]/m1.s2t # I\^2 for Phylogeny: 0.7832493717
+m1I2Resid <- s2m/m1.s2t # I\^2 residual: 0.003640626207
+```
+
+### Subset into human and animal (all random effects)
+
+Check if subgrouping by human/animal and including species as a random effect influences model fit for each group. This will show whether Species is relevant across groups or if the variance is mostly driven by one category (so from human studies)
+
+```{r}
+dd$SpeciesType <- ifelse(dd$Species == "Homo sapiens", "Human", "Animal")
+dd$SpeciesType <- factor(dd$SpeciesType, levels = c("Human", "Animal"))
+
+### --------------- HUMAN
+m1_human <- rma.mv(Zr, ZrVar, random = list(~1|StudyID, ~1|EstimateID),
+                  data = dd[dd$SpeciesType == "Human",], method = "ML")
+summary(m1_human)
+confint_m1_human <- confint(m1_human)
+confint_m1_human
+# Heterogeneity proportion
+
+wj_m1_human <- 1/dd[dd$SpeciesType == "Human",]$ZrVar # wj is weight (inverse of sampling variance) of jth size
+s2m_m1_human <- sum(wj_m1_human)*(length(unique(dd[dd$SpeciesType == "Human",]$StudyID)-1))/((sum(wj_m1_human))^2-sum(wj_m1_human^2)) #s2m is within-study variance, typical sampling error
+m1_human.s2t <- sum(m1_human$sigma2)+s2m_m1_human # total variance
+m1_humanI2total <- sum(m1_human$sigma2)/m1_human.s2t #0.9859336395
+m1_humanI2Study <- m1_human$sigma2[1]/m1_human.s2t #0.6504705178
+m1_humanI2Estimate <- m1_human$sigma2[2]/m1_human.s2t #0.3354631217
+m1_humanI2Resid <- s2m/m1_human.s2t #0.01711328843
+
+LRT_study_human = rma.mv(Zr,ZrVar, random = ~1|StudyID, method = "ML", data = dd[dd$SpeciesType == "Human",])
+LRT_estimate_human = rma.mv(Zr,ZrVar, random = ~1|EstimateID, method = "ML", data = dd[dd$SpeciesType == "Human",])
+anova(m1_human, LRT_study_human) # LRT for StudyID - 205.3071
+anova(m1_human, LRT_estimate_human) # LRT for EstimateID - 16.6789
+
+### --------------- ANIMAL
+m1_animal <- rma.mv(Zr, ZrVar, random = list(~1|StudyID,~1|EstimateID, ~1|Phylogeny),R = list(Phylogeny = PhyloMatrix), method = "ML", data = dd[dd$SpeciesType == "Animal",],)
+summary(m1_animal)
+confint_m1_animal <- confint(m1_animal)
+confint_m1_animal
+
+# Heterogeneity proportion
+
+wj_m1_animal <- 1/dd[dd$SpeciesType == "Animal",]$ZrVar # wj is weight (inverse of sampling variance) of jth size
+s2m_m1_animal <- sum(wj_m1_animal)*(length(unique(dd[dd$SpeciesType == "Animal",]$StudyID)-1))/((sum(wj_m1_animal))^2-sum(wj_m1_animal^2)) #s2m is within-study variance, typical sampling error
+m1_animal.s2t <- sum(m1_animal$sigma2)+s2m_m1_animal # total variance
+m1_animalI2total <- sum(m1_animal$sigma2)/m1_animal.s2t # 0.9898225701
+m1_animalI2Study <- m1_animal$sigma2[1]/m1_animal.s2t # 0.1940391349
+m1_animalI2Estimate <- m1_animal$sigma2[2]/m1_animal.s2t # 0.04254666871
+m1_animalI2Phylogeny <- m1_animal$sigma2[3]/m1_animal.s2t # 0.7532367665
+m1_animalI2Resid <- s2m/m1_animal.s2t #0.003743250647
+
+LRT_study_animal = rma.mv(Zr,ZrVar, random = list(~1|EstimateID, ~1|Phylogeny),R = list(Phylogeny = PhyloMatrix), method = "ML", data = dd[dd$SpeciesType == "Animal",],)
+LRT_estimate_animal = rma.mv(Zr,ZrVar, random = list(~1|StudyID, ~1|Phylogeny),R = list(Phylogeny = PhyloMatrix),method = "ML", data = dd[dd$SpeciesType == "Animal",],)
+LRT_phylogeny_animal = rma.mv(Zr,ZrVar, random = list(~1|StudyID, ~1|EstimateID), method = "ML", data = dd[dd$SpeciesType == "Animal",],)
+
+anova(m1_animal, LRT_study_animal) # 0.7763 (0.3783)
+anova(m1_animal, LRT_estimate_animal) # 14.7227 (0.0001)
+anova(m1_animal, LRT_phylogeny_animal) # 0.3242 (0.5691)
+```
+
+#### Repeat forest plots with human/animal subroups
+
+```{r}
+par(tck=-0.01, mgp=c(2.5,0.5,0), mar=c(2,1,1,1))
+
+# human individual estimates
+m0_human <- rma(Zr,ZrVar, data = dd[dd$SpeciesType == "Human",], method = "ML", slab=paste(Author.s., sep=", "))
+forest(m0_human,
+       alim = c(-3,4), at=seq(-1,1, by=0.25), order="obs",
+       efac=c(0,0,0), col="black", psize=0.75,
+       cex=0.65,
+       cex.lab=1, #x-axis title
+       cex.axis=1, #x-axis labels
+       lty=c("solid","blank"), # remove horizontal line at top of plot
+       xlim=c(-2,1.5), # adjust horizontal plot region limits
+       header="Author(s) and Year",
+       shade="zebra")
+
+# animal individual estimates
+m0_animal <- rma(Zr,ZrVar, data = dd[dd$SpeciesType == "Animal",], method = "ML", slab=paste(Author.s., sep=", "))
+forest(m0_animal,
+       alim = c(-3,4), at=seq(-1,1, by=0.25), order="obs",
+       efac=c(0,0,0), col="black", psize=0.75,
+       cex=0.65,
+       cex.lab=1, #x-axis title
+       cex.axis=1, #x-axis labels
+       lty=c("solid","blank"), # remove horizontal line at top of plot
+       xlim=c(-2,1.5), # adjust horizontal plot region limits
+       header="Author(s) and Year",
+       shade="zebra")
+```
+
+
+```{r}
+models <- list()
+models[['Model 1']] <- m1
+models[['Model 1 - human subset']] <- m1_human
+models[['Model 1 - animal subset']] <- m1_animal
+
+options(modelsummary_get = "broom")
+
+m1summary = modelsummary(models, fmt = 4, shape = term ~ model + statistic,
+                         stars = c("*" = 0.05, "**" = 0.01, "***" = 0.001), 
+                         estimate = "{estimate} ({std.error})",
+                         statistic = c("[{conf.low}, {conf.high}]", "{p.value} {stars}"),
+                         gof_map = c("nobs", "aic","bic","logLik","aicc", "deviance", "df.residual")) |>
+  setNames(c("", "estimate (SE)","95% CI","p-val","estimate (SE)","95% CI","p-val","estimate (SE)","95% CI","p-val"))
+save_tt(m1summary, output = "m1summary.docx",overwrite=T)
+```
+
+# Meta-regression (by including moderators)
+
+```{r}
+#check multicollinearity by checking VIFs (variance inflation factors)
+dd$Artif_Wild <- ifelse(dd$EnvCond == "Human" | dd$EnvCond == "Captive", "Artificial", "Wild")
+
+viftest <- rma(Zr,ZrVar,
+                mods = ~OffSex+ParSex+Artif_Wild+SpermProdSeason+EnvEff+MF_ID+W_B_PEff+OffAgeTL+MethFact+Tissue,
+                data = dd)
+vif.rma(viftest, table=T)
+# Remove Artif_Wild as moderator (EnvCond combined)
+```
+
+## Model Selection
+
+```{r}
+## For some reason this works only on Windows
+## https://gist.github.com/wviechtb/891483eea79da21d057e60fd1e28856b
+## Model Selection using the glmulti and MuMIn Packages with a rma.mv() Model
+############################################################################
+##--------------------------------------------- MuMIn with parallel processing
+## fit the full model (m2) (multilevel phylogenetic meta-analytic model)
+# full = rma.mv(Zr,ZrVar, mods = ~OffSex+ParSex+SpermProdSeason+EnvEff+MF_ID+W_B_PEff+OffAgeTL+MethFact+Tissue,
+#              random = list(~1|StudyID, ~1|EstimateID, ~1|Phylogeny),
+#              R = list(Phylogeny = PhyloMatrix),
+#              method = "ML", data = dd, control = list(rel.tol = 1e-8))
+# 
+# num_cores <- detectCores()
+# clust <- makeCluster(num_cores, type="PSOCK")
+# clusterExport(clust, c("dd","PhyloMatrix"))
+# clusterEvalQ(clust, library(metafor))
+# 
+# system.time(model_selection <- dredge(full, trace=2, cluster=clust))
+# model_selection
+# 
+# stopCluster(clust)
+```
+
+## M2 insignificant interaction: all random effects/all moderators + interactions (parsex * offsex, tissue * offage)
+
+```{r}
+# Set reference levels
+dd$W_B_PEff <- relevel(dd$W_B_PEff, ref = "Neither")
+dd$ParSex <- relevel(dd$ParSex, ref = "F")
+dd$OffSex <- relevel(dd$OffSex, ref = "F")
+dd$Tissue <- relevel(dd$Tissue, ref = "Leucocytes")
+
+m_temp <- rma.mv(Zr,ZrVar,
+             mods = ~ ParSex*OffSex + Tissue*OffAgeTL + OffSex + ParSex+ SpermProdSeason + EnvEff + MF_ID + W_B_PEff + OffAgeTL + MethFact + Tissue,
+             random = list(~1|StudyID, ~1|EstimateID, ~1|Phylogeny),
+             R = list(Phylogeny = PhyloMatrix),
+             method = "ML", data = dd, control = list(rel.tol = 1e-8))
+summary(m_temp)
+```
+
+## M2 All random effects/all moderators + interactions (parsex * offsex)
+
+```{r}
+# Remove non-significant interaction (tissue * offage)
+m2 <- rma.mv(Zr,ZrVar, mods = ~ParSex*OffSex + OffSex + ParSex+ SpermProdSeason + EnvEff + MF_ID + W_B_PEff + OffAgeTL + MethFact + Tissue,
+             random = list(~1|StudyID, ~1|EstimateID, ~1|Phylogeny),
+             R = list(Phylogeny = PhyloMatrix),
+             method = "ML", data = dd, control = list(rel.tol = 1e-8), slab=paste(Author.s.))
+summary(m2)
+
+# Variance components for each random effect [sigma\^2]
+confint_m2 <- confint(m2)
+confint_m2
+# 95% confidence intervals (CIs) + proportion heterogeneity each variance component explains
+m2.s2t <- sum(m2$sigma2)+s2m # total variance
+m2I2total <- sum(m2$sigma2)/m2.s2t
+m2I2Study <- m2$sigma2[1]/m2.s2t
+m2I2Estimate <- m2$sigma2[2]/m2.s2t
+m2I2Phylogeny <- m2$sigma2[3]/m2.s2t
+m2I2Resid <- s2m/m2.s2t 
+
+# Marginal R^2 per factor with r2_ml  
+R2_overall <- list(R2.ParSexOffSex <- rma.mv(Zr, ZrVar, mods = ~ParSex*OffSex, data = dd, method = "ML",
+               random = list(~1|StudyID, ~1|EstimateID, ~1|Phylogeny), R = list(Phylogeny = PhyloMatrix)),
+               
+               R2.OffSex <- rma.mv(Zr, ZrVar, mods = ~OffSex, data = dd, method = "ML",
+               random = list(~1|StudyID, ~1|EstimateID, ~1|Phylogeny), R = list(Phylogeny = PhyloMatrix)),
+               
+               R2.ParSex <- rma.mv(Zr, ZrVar, mods = ~ParSex, data = dd, method = "ML",
+               random = list(~1|StudyID, ~1|EstimateID, ~1|Phylogeny), R = list(Phylogeny = PhyloMatrix)),
+               
+               R2.SpermProdSeason <- rma.mv(Zr, ZrVar, mods = ~SpermProdSeason, data = dd, method = "ML",
+               random = list(~1|StudyID, ~1|EstimateID, ~1|Phylogeny), R = list(Phylogeny = PhyloMatrix)),
+               
+               R2.EnvEff <- rma.mv(Zr, ZrVar, mods = ~EnvEff, data = dd, method = "ML",
+               random = list(~1|StudyID, ~1|EstimateID, ~1|Phylogeny), R = list(Phylogeny = PhyloMatrix)),
+               
+               R2.MF_ID <- rma.mv(Zr, ZrVar, mods = ~MF_ID, data = dd, method = "ML",
+               random = list(~1|StudyID, ~1|EstimateID, ~1|Phylogeny), R = list(Phylogeny = PhyloMatrix)),
+               
+               R2.W_B_PEff <- rma.mv(Zr, ZrVar, mods = ~W_B_PEff, data = dd, method = "ML",
+               random = list(~1|StudyID, ~1|EstimateID, ~1|Phylogeny), R = list(Phylogeny = PhyloMatrix)),
+               
+               R2.OffAgeTL <- rma.mv(Zr, ZrVar, mods = ~OffAgeTL, data = dd, method = "ML",
+               random = list(~1|StudyID, ~1|EstimateID, ~1|Phylogeny), R = list(Phylogeny = PhyloMatrix)),
+               
+               R2.MethFact <- rma.mv(Zr, ZrVar, mods = ~MethFact, data = dd, method = "ML",
+               random = list(~1|StudyID, ~1|EstimateID, ~1|Phylogeny), R = list(Phylogeny = PhyloMatrix)),
+               
+               R2.Tissue <- rma.mv(Zr, ZrVar, mods = ~Tissue, data = dd, method = "ML",
+               random = list(~1|StudyID, ~1|EstimateID, ~1|Phylogeny), R = list(Phylogeny = PhyloMatrix)))
+
+calc_R2 <- function(x) (round(R2_calc(x),7))
+lapply(R2_overall, calc_R2)
+```
+
+### Subset into humans and animals
+
+```{r}
+dd_human <- dd[dd$SpeciesType == "Human", ]
+dd_human$Tissue <- factor(relevel(dd_human$Tissue, ref = "Leucocytes"))
+
+# Fisher's z transformed correlation coefficient histogram for human subset
+histZr_human <- ggplot(data = dd_human, aes(x = Zr))+
+  geom_histogram(binwidth = 0.05, colour = "black", fill = "grey90") +
+  geom_vline(xintercept = mean(dd_human$Zr), linetype = "dashed", linewidth = 0.75, colour = "purple") +
+  geom_vline(xintercept = 0.0949, linetype = "dashed", linewidth = 0.75, colour = "seagreen",show.legend=F) + #xintercept = 0.0949 is Zr adjusted for study, estimateID, phylogeny
+  xlab("Fisher's z transformed correlation coefficient") +
+  ylab("Frequency") +
+  scale_x_continuous(breaks = seq(-1, 1, 0.1)) +
+  scale_y_continuous(breaks = seq(0,40,5), limits = c(0,37), expand = c(0,0)) +
+  theme(plot.margin = margin(0.5, 0.5, 0.5, 0.5, "cm"),
+        
+        panel.background = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        
+        axis.ticks = element_line(colour = "black"),
+        axis.line = element_line(colour = "black"),
+        
+        axis.text.x = element_text(size = 10,family = "Arial", colour = "black", margin=margin(t=5)),
+        axis.text.y = element_text(size = 10, family = "Arial",colour = "black"),
+        axis.title.x = element_text(size = 12, family = "Arial",colour = "black",margin=margin(t=10)),
+        axis.title.y = element_text(size = 12, family = "Arial",colour = "black",margin=margin(r=10)))
+histZr_human
+ggsave(histZr_human, filename = "histZr_human.png", bg = "white", width=(20*(6/7)), height=(20*(3/7)), units = c("cm"))
+
+
+m2_human <- rma.mv(Zr,ZrVar,
+                   mods = ~ParSex*OffSex + OffSex + ParSex + EnvEff + MF_ID + OffAgeTL + MethFact + Tissue,
+                   random = list(~1|StudyID, ~1|EstimateID),
+                   method = "ML", data = dd_human, control = list(rel.tol = 1e-8))
+summary(m2_human)
+
+#orchard_plot(m2_human, mod = "OffAgeTL", group="StudyID", xlab = "Effect size (Zr)")
+# Error in `contrasts<-`(`*tmp*`, value = contr.funs[1 + isOF[nn]]) : 
+#  contrasts can be applied only to factors with 2 or more levels
+
+# Variance components for each random effect [sigma\^2]
+confint_m2_human <- confint(m2_human)
+confint_m2_human
+# 95% confidence intervals (CIs) + proportion heterogeneity each variance component explains
+wj_m2_human <- 1/dd_human$ZrVar # wj is weight (inverse of sampling variance) of jth size
+s2m_m2_human <- sum(wj_m2_human)*(length(unique(dd_human$StudyID)-1))/((sum(wj_m2_human))^2-sum(wj_m2_human^2)) #s2m is within-study variance, typical sampling error
+m2_human.s2t <- sum(m2_human$sigma2)+s2m_m2_human # total variance
+m2_humanI2total <- sum(m2_human$sigma2)/m2_human.s2t # 0.9509387436
+m2_humanI2Study <- m2_human$sigma2[1]/m2_human.s2t # 0.1978028535
+m2_humanI2Estimate <- m2_human$sigma2[2]/m2_human.s2t # 0.7531358902
+m2_humanI2Resid <- s2m_m2_human/m2_human.s2t # 0.04906125638
+
+# Marginal R^2 per factor with r2_ml  
+R2_human <- list(R2.ParSexOffSex <- rma.mv(Zr, ZrVar, mods = ~ParSex*OffSex, data = dd[dd$SpeciesType == "Human",], method = "ML",
+               random = list(~1|StudyID, ~1|EstimateID)),
+               
+               R2.OffSex <- rma.mv(Zr, ZrVar, mods = ~OffSex,data = dd[dd$SpeciesType == "Human",], method = "ML",
+               random = list(~1|StudyID, ~1|EstimateID)),
+               
+               R2.ParSex <- rma.mv(Zr, ZrVar, mods = ~ParSex, data = dd[dd$SpeciesType == "Human",], method = "ML",
+               random = list(~1|StudyID, ~1|EstimateID)),
+               
+               R2.SpermProdSeason <- rma.mv(Zr, ZrVar, mods = ~SpermProdSeason, data = dd[dd$SpeciesType == "Human",], method = "ML",
+               random = list(~1|StudyID, ~1|EstimateID)),
+               
+               R2.EnvEff <- rma.mv(Zr, ZrVar, mods = ~EnvEff, data = dd[dd$SpeciesType == "Human",], method = "ML",
+               random = list(~1|StudyID, ~1|EstimateID)),
+               
+               R2.MF_ID <- rma.mv(Zr, ZrVar, mods = ~MF_ID, data = dd[dd$SpeciesType == "Human",], method = "ML",
+               random = list(~1|StudyID, ~1|EstimateID)),
+               
+               R2.W_B_PEff <- rma.mv(Zr, ZrVar, mods = ~W_B_PEff, data = dd[dd$SpeciesType == "Human",], method = "ML",
+               random = list(~1|StudyID, ~1|EstimateID)),
+               
+               R2.OffAgeTL <- rma.mv(Zr, ZrVar, mods = ~OffAgeTL, data = dd[dd$SpeciesType == "Human",], method = "ML",
+               random = list(~1|StudyID, ~1|EstimateID)),
+               
+               R2.MethFact <- rma.mv(Zr, ZrVar, mods = ~MethFact, data = dd[dd$SpeciesType == "Human",], method = "ML",
+               random = list(~1|StudyID, ~1|EstimateID)),
+               
+               R2.Tissue <- rma.mv(Zr, ZrVar, mods = ~Tissue, data = dd[dd$SpeciesType == "Human",], method = "ML",
+               random = list(~1|StudyID, ~1|EstimateID)))
+
+calc_R2 <- function(x) (round(R2_calc(x),7))
+lapply(R2_human, calc_R2)
+
+dd_animal <- dd[dd$SpeciesType == "Animal", ]
+dd_animal$OffSex <- factor(relevel(dd_animal$OffSex, ref = "F"))
+dd_animal$MethFact <- factor(relevel(dd_animal$MethFact, ref = "qPCR"))
+dd_animal$Tissue <- factor(relevel(dd_animal$Tissue, ref = "Leucocytes"))
+
+# Fisher's z transformed correlation coefficient histogram for animal subset
+histZr_animal <- ggplot(data = dd_animal, aes(x = Zr))+
+  geom_histogram(binwidth = 0.05, colour = "black", fill = "grey90") +
+  geom_vline(xintercept = mean(dd_animal$Zr), linetype = "dashed", linewidth = 0.75, colour = "purple") +
+  geom_vline(xintercept = -0.0865, linetype = "dashed", linewidth = 0.75, colour = "seagreen",show.legend=F) + #xintercept = -0.0865 is Zr adjusted for study, estimateID, phylogeny
+  xlab("Fisher's z transformed correlation coefficient") +
+  ylab("Frequency") +
+  scale_x_continuous(breaks = seq(-1, 1, 0.1)) +
+  scale_y_continuous(breaks = seq(0,40,5), limits = c(0,37), expand = c(0,0)) +
+  theme(plot.margin = margin(0.5, 0.5, 0.5, 0.5, "cm"),
+        
+        panel.background = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        
+        axis.ticks = element_line(colour = "black"),
+        axis.line = element_line(colour = "black"),
+        
+        axis.text.x = element_text(size = 10,family = "Arial", colour = "black", margin=margin(t=5)),
+        axis.text.y = element_text(size = 10, family = "Arial",colour = "black"),
+        axis.title.x = element_text(size = 12, family = "Arial",colour = "black",margin=margin(t=10)),
+        axis.title.y = element_text(size = 12, family = "Arial",colour = "black",margin=margin(r=10)))
+histZr_animal
+ggsave(histZr_animal, filename = "histZr_animal.png", bg = "white", width=(20*(6/7)), height=(20*(3/7)), units = c("cm"))
+
+
+m2_animal <- rma.mv(Zr,ZrVar,
+                   mods = ~ OffSex + ParSex + SpermProdSeason + EnvEff + MF_ID + W_B_PEff + OffAgeTL + MethFact + Tissue,
+             random = list(~1|StudyID, ~1|EstimateID, ~1|Phylogeny), R = list(Phylogeny = PhyloMatrix),
+             method = "ML", data = dd_animal, control = list(rel.tol = 1e-8))
+summary(m2_animal)
+
+orchard_plot(m2_animal, mod = "ParSex", group="StudyID", xlab = "Effect size (Zr)")
+
+
+# Variance components for each random effect [sigma\^2]
+confint_m2_animal <- confint(m2_animal)
+confint_m2_animal
+# 95% confidence intervals (CIs) + proportion heterogeneity each variance component explains
+wj_m2_animal<- 1/dd_animal$ZrVar # wj is weight (inverse of sampling variance) of jth size
+s2m_m2_animal <- sum(wj_m2_animal)*(length(unique(dd_animal$StudyID)-1))/((sum(wj_m2_animal))^2-sum(wj_m2_animal^2)) #s2m is within-study variance, typical sampling error
+
+m2_animal.s2t <- sum(m2_animal$sigma2)+s2m_m2_animal # total variance
+m2_animalI2total <- sum(m2_animal$sigma2)/m2_animal.s2t # 0.9137232861
+m2_animalI2Study <- m2_animal$sigma2[1]/m2_animal.s2t # 0.7211508428
+m2_animalI2Estimate <- m2_animal$sigma2[2]/m2_animal.s2t # 0.1925722508
+m2_animalI2Phylogeny <- m2_animal$sigma2[3]/m2_animal.s2t # 0.0000001925104915
+m2_animalI2Resid <- s2m_m2_animal/m2_animal.s2t # 0.08627671391
+
+R2_animal <- list(R2.ParSexOffSex <- rma.mv(Zr, ZrVar, mods = ~ParSex*OffSex, data = dd[dd$SpeciesType == "Animal",], method = "ML",
+               random = list(~1|StudyID, ~1|EstimateID, ~1|Phylogeny), R = list(Phylogeny = PhyloMatrix)),
+               
+               R2.OffSex <- rma.mv(Zr, ZrVar, mods = ~OffSex, data = dd[dd$SpeciesType == "Animal",], method = "ML",
+               random = list(~1|StudyID, ~1|EstimateID, ~1|Phylogeny), R = list(Phylogeny = PhyloMatrix)),
+               
+               R2.ParSex <- rma.mv(Zr, ZrVar, mods = ~ParSex, data = dd[dd$SpeciesType == "Animal",], method = "ML",
+               random = list(~1|StudyID, ~1|EstimateID, ~1|Phylogeny), R = list(Phylogeny = PhyloMatrix)),
+               
+               R2.SpermProdSeason <- rma.mv(Zr, ZrVar, mods = ~SpermProdSeason, data = dd[dd$SpeciesType == "Animal",], method = "ML",
+               random = list(~1|StudyID, ~1|EstimateID, ~1|Phylogeny), R = list(Phylogeny = PhyloMatrix)),
+               
+               R2.EnvEff <- rma.mv(Zr, ZrVar, mods = ~EnvEff, data = dd[dd$SpeciesType == "Animal",], method = "ML",
+               random = list(~1|StudyID, ~1|EstimateID, ~1|Phylogeny), R = list(Phylogeny = PhyloMatrix)),
+               
+               R2.MF_ID <- rma.mv(Zr, ZrVar, mods = ~MF_ID, data = dd[dd$SpeciesType == "Animal",], method = "ML",
+               random = list(~1|StudyID, ~1|EstimateID, ~1|Phylogeny), R = list(Phylogeny = PhyloMatrix)),
+               
+               R2.W_B_PEff <- rma.mv(Zr, ZrVar, mods = ~W_B_PEff, data = dd[dd$SpeciesType == "Animal",], method = "ML",
+               random = list(~1|StudyID, ~1|EstimateID, ~1|Phylogeny), R = list(Phylogeny = PhyloMatrix)),
+               
+               R2.OffAgeTL <- rma.mv(Zr, ZrVar, mods = ~OffAgeTL, data = dd[dd$SpeciesType == "Animal",], method = "ML",
+               random = list(~1|StudyID, ~1|EstimateID, ~1|Phylogeny), R = list(Phylogeny = PhyloMatrix)),
+               
+               R2.MethFact <- rma.mv(Zr, ZrVar, mods = ~MethFact, data = dd[dd$SpeciesType == "Animal",], method = "ML",
+               random = list(~1|StudyID, ~1|EstimateID, ~1|Phylogeny), R = list(Phylogeny = PhyloMatrix)),
+               
+               R2.Tissue <- rma.mv(Zr, ZrVar, mods = ~Tissue, data = dd[dd$SpeciesType == "Animal",], method = "ML",
+               random = list(~1|StudyID, ~1|EstimateID, ~1|Phylogeny), R = list(Phylogeny = PhyloMatrix)))
+
+calc_R2 <- function(x) (round(R2_calc(x),7))
+lapply(R2_animal, calc_R2)
+```
+
+### Save
+
+```{r}
+models <- list(m2, m2_human, m2_animal)
+
+options(modelsummary_get = "broom")
+
+m2summary = modelsummary(
+  models, shape = term ~ model + statistic, fmt = fmt_sprintf("%.4f"),
+  stars = c("*" = 0.05, "**" = 0.01, "***" = 0.001),
+  estimate = "{estimate} ({std.error})",
+  statistic = c("[{conf.low}, {conf.high}]", "{p.value} {stars}"),
+  gof_map = c("nobs", "aic","bic","logLik","aicc", "deviance", "df.residual"))
+m2summary
+#save_tt(m2summary, output = "m2summary.docx",overwrite=T)
+```
+
+## Emmeans m2
+
+```{r}
+### create reference grid
+emmprepm2 <- emmprep(m2, verbose=TRUE)
+### separate for human and animal subsets
+emmprepm2_human <- emmprep(m2_human, verbose=TRUE)
+emmprepm2_animal <- emmprep(m2_animal, verbose=TRUE)
+
+### Check what parental-offspring sex combinations are significantly different
+### from each other
+emm_m2_human_SexInteraction <- emmeans(emmprepm2_human, ~ ParSex*OffSex)
+pairs(emm_m2_human_SexInteraction)
+HumanSexInteraction_pairs <- as.data.frame(pairs(emm_m2_human_SexInteraction))
+write.xlsx(HumanSexInteraction_pairs, "SexCombination_posthoc.xlsx")
+pairs_sig <- HumanSexInteraction_pairs%>%filter(p.value<0.05)
+
+### Check whether lab method levels are different from each other
+emm_m2_human_MethFact <- emmeans(emmprepm2_human, ~ MethFact)
+pairs(emm_m2_human_MethFact)
+emm_m2_animal_MethFact <- emmeans(emmprepm2_animal, ~ MethFact)
+pairs(emm_m2_animal_MethFact)
+### create dataframes for plotting
+plot_human_MethFact <- tidy(emm_m2_human_MethFact, conf.int = TRUE)
+plot_animal_MethFact <- tidy(emm_m2_animal_MethFact, conf.int = TRUE)
+
+### Plot
+human_MethFact <- ggplot(plot_human_MethFact, aes(x = MethFact, y = estimate)) +
+  geom_bar(stat = "identity", color = "black", fill = "gray", width = 0.6) +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), 
+                width = 0.2) +
+  theme_classic() + 
+  labs(x = "Laboratory method", y = "Estimate", title = "") +
+  scale_x_discrete(labels = c("TRFInGel" = "TRF in-gel", "TRFSouthern" = "TRF Southern")) +
+  geom_signif(comparisons = list(c("qPCR", "TRFInGel"), c("qPCR", "TRFSouthern"), 
+                                 c("TRFInGel", "TRFSouthern"), 
+                                 c("TRFInGel", "WGS")),
+              annotations = c("***", "*", "***", "***"),
+              y_position = c(0.65, 0.75, 0.85, 0.95), 
+              tip_length = 0.03,
+              textsize = 4,
+              vjust = 0.5)
+human_MethFact
+animal_MethFact <- ggplot(plot_animal_MethFact, aes(x = MethFact, y = estimate)) +
+  geom_bar(stat = "identity", color = "black", fill = "gray", width = 0.6) +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), 
+                width = 0.2) +
+  theme_classic() + 
+  labs(x = "Laboratory method", y = "Estimate", title = "") +
+  scale_x_discrete(labels = c("TRFInGel" = "TRF in-gel", "TRFSouthern" = "TRF Southern")) +
+  geom_signif(comparisons = list(c("qPCR", "TRFSouthern")),
+              annotations = c("**"),
+              y_position = c(0.1),
+              tip_length = 0.03,
+              textsize = 4,
+              vjust = 0.5)
+animal_MethFact
+### To combine to two plots, set the y-axis scale
+y_limit <- c(-1.1, 1.1)
+### A bit edition
+human_MethFact <- human_MethFact + ylim(y_limit) + 
+  ggtitle("Human") + theme(plot.title = element_text(hjust = 0.5),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+animal_MethFact <- animal_MethFact + ylim(y_limit) +
+  ggtitle("Non-human") + theme(plot.title = element_text(hjust = 0.5),
+        axis.text.x = element_text(angle = 45, hjust = 1))
+### Combine the plots
+combined_plot <- (human_MethFact + animal_MethFact) + 
+  plot_layout(ncol = 2) + 
+  theme(plot.margin = margin(10, 10, 10, 10)) 
+combined_plot
+### Save
+ggsave(combined_plot, filename = "LabMethod.png", bg = "white", width=16, height=12, units = c("cm"))
+
+# ### estimated marginal mean using default equal cell weighting
+# emmeans(emmprepm2,
+#         specs="1", #In the special case where the mean (or weighted mean) of all the predictions is desired, specify specs as ~ 1 or "1".
+#         type="response",
+#         weights="proportional" #Weight in proportion to the frequencies (in the original data) of the factor combinations that are averaged over
+#         )
+# 
+# emm_m2 <- tidy(emmprepm2)
+# write.csv(emm_m2, "emm_m2.csv", row.names = FALSE)
+```
+
+## Orchard plot humans
+
+```{r}
+plotdf_human <- dd_human %>%
+  mutate(ParSex = factor(recode(ParSex, "F"="Mother","M"="Father"), levels = c("Mother", "Father")),
+         OffSex = factor(recode(OffSex, "F"="Daughter","M"="Son","Both"="Unspecified"), levels = c("Daughter", "Son","Unspecified")),
+         SpermProdSeason = factor(SpermProdSeason, levels = c("Seasonal", "Continuous")),
+         MethFact = factor(recode(MethFact, "qPCR"=" qPCR","TRFSouthern"="TRF-SB","TRFInGel"="TRF-in-gel", "WGS"="WGS"), levels = c(" qPCR","TRF-SB","TRF-in-gel","WGS")),
+         OffAgeTL = factor(OffAgeTL, levels = c("Adult", "Juvenile","Both")),
+         Tissue = factor(recode(Tissue, "Leucocytes"="Leucocytes"), levels = c("Leucocytes", "Other")),
+         W_B_PEff = factor(W_B_PEff, levels = c("Within", "Between", "Neither")),
+         EnvEff = factor(recode(EnvEff,"Yes"="Accounted","No"="Not accounted"),levels = c("Accounted", "Not accounted")),
+         MF_ID = factor(recode(MF_ID,"Yes"="Accounted","No"="Not accounted"), levels = c("Accounted", "Not accounted")))
+
+# # Define reference levels
+# plotdf_human$W_B_PEff <- relevel(plotdf_human$W_B_PEff, ref = "Neither")
+# plotdf_human$ParSex <- relevel(plotdf_human$ParSex, ref = "Female")
+# plotdf_human$OffSex <- relevel(plotdf_human$OffSex, ref = "Female")
+# plotdf_human$EnvEff <- relevel(plotdf_human$EnvEff, ref = "Not accounted")
+# plotdf_human$MF_ID <- relevel(plotdf_human$MF_ID, ref = "Not accounted")
+# plotdf_human$OffAgeTL <- relevel(plotdf_human$OffAgeTL, ref = "Adult")
+# plotdf_human$MethFact <- relevel(plotdf_human$MethFact, ref = "qPCR")
+# plotdf_human$Tissue <- relevel(plotdf_human$Tissue, ref = "Leukocytes")
+
+m2plot_human <- rma.mv(Zr,ZrVar,
+                   mods = ~ParSex*OffSex + OffSex + ParSex + EnvEff + MF_ID + OffAgeTL + MethFact + Tissue,
+                   random = list(~1|StudyID, ~1|EstimateID),
+                   method = "ML", data = plotdf_human, control = list(rel.tol = 1e-8))
+summary(m2plot_human)
+
+# m2humanOffSex <- orchard_plot(m2plot_human, mod="OffSex", group="StudyID", xlab = "Zr",transfm = c("none")) +
+#   ggtitle("offspring sex") +
+#   theme(plot.title = element_text(hjust = 0.5))
+# m2humanOffSex
+# 
+# m2humanParSex <- orchard_plot(m2plot_human, mod="ParSex", group="StudyID", xlab = "Zr",transfm = c("none")) +
+#   ggtitle("parental sex") +
+#   theme(plot.title = element_text(hjust = 0.5))
+
+m2humanParOffSex_prep <- mod_results(m2plot_human, mod = "OffSex", group = "StudyID", 
+    by = "ParSex")
+m2humanParOffSex <- orchard_plot(m2humanParOffSex_prep, mod="OffSex", group="StudyID", xlab = "Zr", transfm = c("none")) +
+  xlab("Offspring sex") +
+  ggtitle("Parental sex : Offspring sex") +
+  theme(plot.title = element_text(hjust = 0.5),
+        legend.position = c(0.9, 0.04)) +
+  guides(size = "none",
+         shape = guide_legend(title = "Parental sex"))
+
+m2humanMethFact  <- orchard_plot(m2plot_human, mod="MethFact", group="StudyID", xlab = "Zr",transfm = c("none")) +
+  ggtitle("Laboratory method") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+m2humanOffAgeTL <- orchard_plot(m2plot_human, mod="OffAgeTL", group="StudyID", xlab = "Zr",transfm = c("none")) +
+  ggtitle("Offspring age") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+m2humanTissue <- orchard_plot(m2plot_human, mod="Tissue", group="StudyID", xlab = "Zr",transfm = c("none")) +
+  ggtitle("Cell type") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+m2humanEnvEff <- orchard_plot(m2plot_human, mod="EnvEff", group="StudyID", xlab = "Zr",transfm = c("none")) +
+  ggtitle("Parental environment effect") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+m2humanMF_ID <- orchard_plot(m2plot_human, mod="MF_ID", group="StudyID", xlab = "Zr",transfm = c("none")) +
+  ggtitle("Parent's identity controlled for") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+HumanOrchards <- ggarrange(m2humanParOffSex,m2humanMethFact,m2humanOffAgeTL,m2humanTissue,m2humanEnvEff,m2humanMF_ID, ncol = 3, nrow = 2, labels = "auto")
+HumanOrchards
+
+#ggsave("HumanOrchards.png", plot = HumanOrchards, width = 12, height = 8, dpi = 300)
+ggsave("HumanOrchards.svg", plot = HumanOrchards, width = 12, height = 8, dpi = 300)
+```
+
+## Orchard plot animals
+
+```{r}
+plotdf_animal <- dd_animal %>%
+  mutate(ParSex = factor(recode(ParSex, "F"="Mother","M"="Father"), levels = c("Mother", "Father")),
+         OffSex = factor(recode(OffSex, "F"="Daughter","M"="Son","Both"="Unspecified"), levels = c("Daughter", "Son","Unspecified")),
+         SpermProdSeason = factor(SpermProdSeason, levels = c("Seasonal", "Continuous")),
+         MethFact = factor(recode(MethFact, "qPCR"=" qPCR","TRFSouthern"="TRF-SB","TRFInGel"="TRF-in-gel", "WGS"="WGS"), levels = c(" qPCR","TRF-SB","TRF-in-gel","WGS")),
+         OffAgeTL = factor(OffAgeTL, levels = c("Adult", "Juvenile","Both")),
+         Tissue = factor(recode(Tissue, "Leucocytes"="Leucocytes", "Erythrocytes"="Erythrocytes"), levels = c("Leucocytes", "Erythrocytes", "Other")),
+         W_B_PEff = factor(W_B_PEff, levels = c("Within", "Between", "Neither")),
+         EnvEff = factor(recode(EnvEff,"Yes"="Accounted","No"="Not accounted"),levels = c("Accounted", "Not accounted")),
+         MF_ID = factor(recode(MF_ID,"Yes"="Accounted","No"="Not accounted"), levels = c("Accounted", "Not accounted")))
+
+# plotdf_animal$W_B_PEff <- relevel(plotdf_animal$W_B_PEff, ref = "Neither")
+# plotdf_animal$ParSex <- relevel(plotdf_animal$ParSex, ref = "Female")
+# plotdf_animal$OffSex <- relevel(plotdf_animal$OffSex, ref = "Female")
+
+m2plot_animal <- rma.mv(Zr,ZrVar,
+                   mods = ~ OffSex + ParSex + SpermProdSeason + EnvEff + MF_ID + W_B_PEff + OffAgeTL + MethFact + Tissue,
+             random = list(~1|StudyID, ~1|EstimateID, ~1|Phylogeny), R = list(Phylogeny = PhyloMatrix),
+             method = "ML", data = plotdf_animal, control = list(rel.tol = 1e-8))
+summary(m2plot_animal)
+
+# m2animalOffSex <- orchard_plot(m2plot_animal, mod="OffSex", group="StudyID", xlab = "Zr",transfm = c("none")) +
+#   ggtitle("offspring sex") +
+#   theme(plot.title = element_text(hjust = 0.5))
+# m2animalOffSex
+# 
+# m2animalParSex <- orchard_plot(m2plot_animal, mod="ParSex", group="StudyID", xlab = "Zr",transfm = c("none")) +
+#   ggtitle("parental sex") +
+#   theme(plot.title = element_text(hjust = 0.5))
+# m2animalParSex
+
+m2animalParOffSex_prep <- mod_results(m2plot_animal, mod = "OffSex", group = "StudyID", 
+    by = "ParSex")
+m2animalParOffSex <- orchard_plot(m2animalParOffSex_prep, mod="OffSex", group="StudyID", xlab = "Zr", transfm = c("none")) +
+  xlab("Offspring sex") +
+  ggtitle("Parental sex : Offspring sex") +
+  theme(plot.title = element_text(hjust = 0.5),
+        legend.position = c(0.9, 0.04)) +
+  guides(size = "none",
+         shape = guide_legend(title = "Parental sex"))
+
+m2animalSpermProdSeason <- orchard_plot(m2plot_animal, mod="SpermProdSeason", group="StudyID", xlab = "Zr") +
+  ggtitle("Sperm seasonality") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+m2animalMethFact  <- orchard_plot(m2plot_animal, mod="MethFact", group="StudyID", xlab = "Zr",transfm = c("none")) +
+  ggtitle("Laboratory method") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+m2animalOffAgeTL <- orchard_plot(m2plot_animal, mod="OffAgeTL", group="StudyID", xlab = "Zr",transfm = c("none")) +
+  ggtitle("Offspring age") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+m2animalTissue <- orchard_plot(m2plot_animal, mod="Tissue", group="StudyID", xlab = "Zr",transfm = c("none")) +
+  ggtitle("Cell type") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+m2animalEnvEff <- orchard_plot(m2plot_animal, mod="EnvEff", group="StudyID", xlab = "Zr",transfm = c("none")) +
+  ggtitle("Parental environment effect") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+m2animalMF_ID <- orchard_plot(m2plot_animal, mod="MF_ID", group="StudyID", xlab = "Zr",transfm = c("none")) +
+  ggtitle("Parent's identity controlled for") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+m2animalW_B_PEff <- orchard_plot(m2plot_animal, mod="W_B_PEff", group="StudyID", xlab = "Zr") +
+  ggtitle("Within/between-parents effect") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+AnimalOrchards <- ggarrange(m2animalParOffSex,m2animalSpermProdSeason, m2animalMethFact,m2animalOffAgeTL,m2animalTissue,m2animalEnvEff,m2animalMF_ID, m2animalW_B_PEff, ncol = 3, nrow = 3, labels = "auto")
+AnimalOrchards
+
+#ggsave("AnimalOrchards.png", plot = AnimalOrchards, width = 12, height = 12, dpi = 300)
+ggsave("AnimalOrchards.svg", plot = AnimalOrchards, width = 12, height = 12, dpi = 300)
+```
+
+
+### Subset into humans and animals
+
+```{r}
+m3_human <- rma.mv(Zr,ZrVar,
+             mods = ~ParSex*OffSex + Tissue*OffAgeTL + SpermProdSeason+EnvEff + EnvCond + MF_ID + W_B_PEff + OffAgeTL + MethFact + Tissue,
+             random = list(~1|StudyID, ~1|EstimateID),
+             method = "ML", data = dd[dd$SpeciesType == "Human",], control = list(rel.tol = 1e-8))
+# performance::model_performance(m3_human, metrics="all")
+m3_human_summary <- tidy(m3_human, conf.int = T)
+
+m3_animal <- rma.mv(Zr,ZrVar,
+             mods = ~ParSex*OffSex + Tissue*OffAgeTL + SpermProdSeason+EnvEff + EnvCond + MF_ID + W_B_PEff + OffAgeTL + MethFact + Tissue,
+             random = list(~1|StudyID, ~1|Species, ~1|EstimateID),
+             method = "ML", data = dd[dd$SpeciesType == "Animal",], control = list(rel.tol = 1e-8))
+#performance::model_performance(m3_animal, metrics="all")
+m3_animal_summary <- tidy(m3_animal, conf.int = T)
+```
+
+#### Relevel
+
+```{r}
+# releveled to male "M" offspring
+dd$OffSex <- relevel(dd$OffSex, ref = "M")
+m3M <- rma.mv(Zr,ZrVar,
+             mods = ~OffSex+ParSex+SpermProdSeason+EnvEff+EnvCond+MF_ID+W_B_PEff+OffAgeTL+MethFact+Tissue,
+             random = list(~1|StudyID, ~1|EstimateID, ~1|Species, ~1|Phylogeny),
+             R = list(Phylogeny = PhyloMatrix),
+             method = "ML", data = dd, control = list(rel.tol = 1e-8), slab=paste(Author.s.))
+m3M_human <- rma.mv(Zr,ZrVar,
+             mods = ~OffSex+ParSex+SpermProdSeason+EnvEff+EnvCond+MF_ID+W_B_PEff+OffAgeTL+MethFact+Tissue,
+             random = list(~1|StudyID, ~1|EstimateID),
+             method = "ML", data = dd[dd$SpeciesType == "Human",], control = list(rel.tol = 1e-8))
+m3M_animal <- rma.mv(Zr,ZrVar,
+             mods = ~OffSex+ParSex+SpermProdSeason+EnvEff+EnvCond+MF_ID+W_B_PEff+OffAgeTL+MethFact+Tissue,
+             random = list(~1|StudyID, ~1|Species, ~1|EstimateID),
+             method = "ML", data = dd[dd$SpeciesType == "Animal",], control = list(rel.tol = 1e-8))
+
+# releveled to "Both" offspring
+dd$OffSex <- relevel(dd$OffSex, ref = "Both")
+m3B <- rma.mv(Zr,ZrVar,
+             mods = ~OffSex+ParSex+SpermProdSeason+EnvEff+EnvCond+MF_ID+W_B_PEff+OffAgeTL+MethFact+Tissue,
+             random = list(~1|StudyID, ~1|EstimateID, ~1|Species, ~1|Phylogeny),
+             R = list(Phylogeny = PhyloMatrix),
+             method = "ML", data = dd, control = list(rel.tol = 1e-8), slab=paste(Author.s.))
+m3B_human <- rma.mv(Zr,ZrVar,
+             mods = ~OffSex+ParSex+SpermProdSeason+EnvEff+EnvCond+MF_ID+W_B_PEff+OffAgeTL+MethFact+Tissue,
+             random = list(~1|StudyID, ~1|EstimateID),
+             method = "ML", data = dd[dd$SpeciesType == "Human",], control = list(rel.tol = 1e-8))
+m3B_animal <- rma.mv(Zr,ZrVar,
+             mods = ~OffSex+ParSex+SpermProdSeason+EnvEff+EnvCond+MF_ID+W_B_PEff+OffAgeTL+MethFact+Tissue,
+             random = list(~1|StudyID, ~1|Species, ~1|EstimateID),
+             method = "ML", data = dd[dd$SpeciesType == "Animal",], control = list(rel.tol = 1e-8))
+
+m3M_summary <- tidy(m3M, conf.int = T)
+m3M_human_summary <- tidy(m3M_human, conf.int = T)
+m3M_animal_summary <- tidy(m3M_animal, conf.int = T)
+m3B_summary <- tidy(m3B, conf.int = T)
+m3B_human_summary <- tidy(m3B_human, conf.int = T)
+m3B_animal_summary <- tidy(m3B_animal, conf.int = T)
+```
+
+# Publication and time-lag biases
+
+## Funnel plot
+
+Using residuals from m2
+
+```{r}
+svglite::svglite(filename="funnel.svg", width = 7, height = 5, pointsize = 12, bg = "white")
+
+funnel(m2, yaxis="seinv", #inverse of the standard errors
+       level = c(90, 95, 99), shade = c("white", "gray55", "gray75"), back = "white",
+       digits = 1L,
+       xlim = c(-1,1), ylim = c(2.5, 12.5), steps = 5, 
+       refline = 0,
+       legend = list(x = "topright",show = "cis",cex = 0.7), cex = 0.35,
+       xlab = "Residual Zr",
+       ylab = "Precision (inverse of standard error)")
+dev.off() 
+```
+
+Split by humans and animals (residuals from m2)
+
+```{r}
+# Both on one plot
+
+SpeciesCol <- c("green2", "purple")[dd$SpeciesType]
+
+svglite::svglite(filename="funnel_split.svg", width = 7, height = 5, pointsize = 12, bg = "white")
+funnel(m2, yaxis="seinv", 
+       level = c(90, 95, 99), shade = c("white", "gray55", "gray75"),
+       back = "white", col = SpeciesCol,
+       digits = 1L, xlim = c(-1,1), ylim = c(2.5, 12.5), steps = 5, 
+       refline = 0, # or adjusted mean Zr from the model?
+       legend = list(x = "topright", show = "cis", cex = 0.7),
+       cex = 0.35, xlab = "Residual Zr", ylab = "Precision (inverse of standard error)")
+dev.off() 
+
+# Humans
+
+svglite::svglite(filename="funnel_humans.svg", width = 7, height = 5, pointsize = 12, bg = "white")
+funnel(m2_human, yaxis="seinv", 
+       level = c(90, 95, 99), shade = c("white", "gray55", "gray75"),
+       back = "white",
+       digits = 1L, xlim = c(-1,1), ylim = c(2.5, 30), steps = 12,
+       refline = 0, # or adjusted mean Zr from the model?
+       legend = list(x = "topright", show = "cis", cex = 0.7),
+       cex = 0.35, xlab = "Residual Zr", ylab = "Precision (inverse of standard error)")
+mtext("A) Human subset", side = 3, adj = 0, line = 1, font = 1)
+dev.off() 
+
+# Animals
+svglite::svglite(filename="funnel_animals.svg", width = 7, height = 5, pointsize = 12, bg = "white")
+funnel(m2_animal, yaxis="seinv", 
+       level = c(90, 95, 99), shade = c("white", "gray55", "gray75"),
+       back = "white",
+       digits = 1L, xlim = c(-1,1), ylim = c(2.5, 30), steps = 12, 
+       refline = 0, # or adjusted mean Zr from the model?
+       legend = list(x = "topright", show = "cis", cex = 0.7),
+       cex = 0.35, xlab = "Residual Zr", ylab = "Precision (inverse of standard error)")
+mtext("B) Non-human subset", side = 3, adj = 0, line = 1, font = 1)
+dev.off() 
+```
+
+## Egger's test
+
+To statistically test for asymmetry, adding random effects to account for non-independence among estimates using sampling variance for publication bias and centered year for time-lag
+
+```{r}
+# Overall
+m.pubbias <- rma.mv(Zr,ZrVar,
+                    mods = ~ZrVar + year.c + ParSex*OffSex + OffSex + ParSex + SpermProdSeason + EnvEff + MF_ID + W_B_PEff + OffAgeTL + MethFact + Tissue, random = list(~1|StudyID, ~1|EstimateID, ~1|Phylogeny), R = list(Phylogeny = PhyloMatrix), method = "ML", data = dd)
+#m.pubbias
+
+m.pubbias.human <- rma.mv(Zr,ZrVar,
+             mods = ~ZrVar + year.c + ParSex*OffSex + OffSex + ParSex + EnvEff + MF_ID + W_B_PEff + OffAgeTL + MethFact + Tissue,
+             random = list(~1|StudyID, ~1|EstimateID),
+             method = "ML", data = dd[dd$SpeciesType == "Human",], control = list(rel.tol = 1e-8))
+m.pubbias.human
+
+m.pubbias.animal <- rma.mv(Zr,ZrVar,
+             mods = ~ZrVar + year.c + ParSex*OffSex + OffSex + ParSex + SpermProdSeason + EnvEff + MF_ID + W_B_PEff + OffAgeTL + MethFact + Tissue, random = list(~1|StudyID, ~1|EstimateID, ~1|Phylogeny), R = list(Phylogeny = PhyloMatrix), method = "ML", data = dd[dd$SpeciesType == "Animal",], control = list(rel.tol = 1e-8))
+m.pubbias.animal
+```
+
+# Plot figures
+
+## Moderators
+
+```{r}
+
+### Overall
+
+plotdf <- dd %>%
+  mutate(ParSex = factor(recode(ParSex, "F"="Female","M"="Male"), levels = c("Female", "Male")),
+         OffSex = factor(recode(OffSex, "F"="Female","M"="Male","Both"="Unspecified"), levels = c("Female", "Male","Unspecified")),
+         SpermProdSeason = factor(SpermProdSeason, levels = c("Seasonal", "Continuous")),
+         MethFact = factor(recode(MethFact, "qPCR"="qPCR","TRFSouthern"="TRF-SB","TRFInGel"="TRF-IG", "WGS"="WGS"), levels = c("qPCR","TRF-SB","TRF-IG","WGS")),
+         OffAgeTL = factor(OffAgeTL, levels = c("Adult", "Juvenile","Both")),
+         Tissue = factor(Tissue, levels = c("Leucocytes","Erythrocytes","Other")),
+        # EnvCond = factor(EnvCond, levels = c("Wild", "Human")),
+         W_B_PEff = factor(W_B_PEff, levels = c("Within", "Between", "Neither")),
+         EnvEff = factor(recode(EnvEff,"Yes"="Accounted","No"="Not accounted"),levels = c("Accounted", "Not accounted")),
+         MF_ID = factor(recode(MF_ID,"Yes"="Accounted","No"="Not accounted"), levels = c("Accounted", "Not accounted")))
+
+# Unified moderators/fixed effects plot with facet_wrap
+plotdf_long <- plotdf %>% pivot_longer(cols = c(MethFact, Tissue, SpermProdSeason, OffSex, OffAgeTL, ParSex, EnvEff, W_B_PEff, MF_ID), names_to = "Category", values_to = "Value") %>% mutate(Category = factor(Category, levels = c("ParSex","OffSex","SpermProdSeason","Tissue","OffAgeTL","MethFact","W_B_PEff","EnvEff","MF_ID"))) %>% mutate(Value = factor(Value))
+
+meta_theme <- list(theme(panel.background = element_blank(),
+                         panel.grid.major = element_blank(),
+                         panel.grid.minor = element_blank(),
+                         panel.border = element_rect(colour = "black", fill=NA, size=1),
+                         axis.ticks = element_line(colour = "black"),
+                         axis.text.x = element_text(size = 10, colour = "black", margin = margin(t = 5)),
+                         axis.text.y = element_text(size = 10, colour = "black"),
+                         axis.title.x = element_text(size = 12, colour = "black", margin = margin(t = 20)), 
+                         axis.title.y = element_text(size = 12, colour = "black", margin = margin(r = 5))), 
+                         #axis.line = element_line(colour = "black"),
+                   geom_bar(stat = "count", width = 0.5, colour = "black", fill = "grey75"),
+                   geom_text(aes(label = after_stat(count)), stat = "count", size = 3, vjust = -0.5),
+                   scale_y_continuous(breaks = seq(0,140,20), limits = c(0,145), expand = c(0,0)),
+                   ylab("Frequency"))
+
+faceted_moderators_comb_plot <- ggplot(plotdf_long, aes(x = Value)) +
+  facet_wrap(~ Category,
+             labeller = labeller(Category = c("ParSex" = "(a) Parental sex",
+                                              "OffSex" = "(b) Offspring sex",
+                                              "SpermProdSeason" = "(c) Sperm production seasonality",
+                                              "Tissue" = "(d) Cell type",
+                                              "OffAgeTL" = "(e) Offspring age at measurement",
+                                              "MethFact" = "(f) Laboratory method",
+                                              "W_B_PEff" = "(g) Within-/between-parent effects",
+                                              "EnvEff" = "(h) Parental environment effects",
+                                              "MF_ID" = "(i) Parent's identity controlled for")),
+             nrow = 3, ncol = 3, scales = "free_x", strip.position = "top", axes = "margins", axis.labels = "all_x") +
+  meta_theme + theme(strip.background = element_blank(),
+                     strip.text = element_text(size = 12),
+                     panel.spacing.x = unit(0.1, "cm"),
+                     panel.spacing.y = unit(0.15, "cm"),
+                     plot.margin = margin(0.1, 0.1, 0.1, 0.1, "cm")) + xlab("Levels of the fixed effects")
+faceted_moderators_comb_plot
+#ggsave(faceted_moderators_comb_plot, filename = "faceted_moderators_comb_plot.png", bg = "white", width=30, height=30,  units = c("cm"))
+ggsave(faceted_moderators_comb_plot, filename = "faceted_moderators_comb_plot.svg", bg = "white", width=30, height=30,  units = c("cm"))
+```
+
+
+### Human subset
+```{r}
+plotdf_human <- dd_human %>%
+  mutate(ParSex = factor(recode(ParSex, "F"="Female","M"="Male"), levels = c("Female", "Male")),
+         OffSex = factor(recode(OffSex, "F"="Female","M"="Male","Both"="Unspecified"), levels = c("Female", "Male","Unspecified")),
+         SpermProdSeason = factor(SpermProdSeason, levels = c("Seasonal", "Continuous")),
+         MethFact = factor(recode(MethFact, "qPCR"="qPCR","TRFSouthern"="TRF-SB","TRFInGel"="TRF-IG", "WGS"="WGS"), levels = c("qPCR","TRF-SB","TRF-IG","WGS")),
+         OffAgeTL = factor(OffAgeTL, levels = c("Adult", "Juvenile","Both")),
+         Tissue = factor(recode(Tissue,"Leucocytes"="Leucocytes","Erythrocytes"="Erythrocytes","Other"="Other"),
+                         levels = c("Leucocytes", "Erythrocytes","Other")),
+        # EnvCond = factor(EnvCond, levels = c("Wild", "Human")),
+         W_B_PEff = factor(W_B_PEff, levels = c("Within", "Between", "Neither")),
+         EnvEff = factor(recode(EnvEff,"Yes"="Accounted","No"="Not accounted"),levels = c("Accounted", "Not accounted")),
+         MF_ID = factor(recode(MF_ID,"Yes"="Accounted","No"="Not accounted"), levels = c("Accounted", "Not accounted")))
+
+# Unified moderators/fixed effects plot with facet_wrap
+plotdf_long_human <- plotdf_human %>% pivot_longer(cols = c(MethFact, Tissue, SpermProdSeason, OffSex, OffAgeTL, ParSex, EnvEff, W_B_PEff, MF_ID), names_to = "Category", values_to = "Value") %>% mutate(Category = factor(Category, levels = c("ParSex","OffSex","SpermProdSeason","Tissue","OffAgeTL","MethFact","W_B_PEff","EnvEff","MF_ID"))) %>% mutate(Value = factor(Value))
+
+faceted_moderators_comb_plot <- ggplot(plotdf_long_human, aes(x = Value)) +
+  facet_wrap(~ Category,
+             labeller = labeller(Category = c("ParSex" = "(a) Parental sex",
+                                              "OffSex" = "(b) Offspring sex",
+                                              "SpermProdSeason" = "(c) Sperm production seasonality",
+                                              "Tissue" = "(d) Cell type",
+                                              "OffAgeTL" = "(e) Offspring age at measurement",
+                                              "MethFact" = "(f) Laboratory method",
+                                              "W_B_PEff" = "(g) Within-/between-parent effects",
+                                              "EnvEff" = "(h) Parental environment effects",
+                                              "MF_ID" = "(i) Parent's identity controlled for")),
+             nrow = 3, ncol = 3, scales = "free_x", strip.position = "top", axes = "margins", axis.labels = "all_x") +
+  meta_theme + theme(strip.background = element_blank(),
+                     strip.text = element_text(size = 12),
+                     panel.spacing.x = unit(0.1, "cm"),
+                     panel.spacing.y = unit(0.15, "cm"),
+                     plot.margin = margin(0.1, 0.1, 0.1, 0.1, "cm")) + xlab("Levels of the fixed effects")
+faceted_moderators_comb_plot
+#ggsave(faceted_moderators_comb_plot, filename = "faceted_moderators_comb_plot.png", bg = "white", width=30, height=30,  units = c("cm"))
+ggsave(faceted_moderators_comb_plot, filename = "faceted_moderators_comb_plot_human.svg", bg = "white", width=30, height=30,  units = c("cm"))
+```
+
+### Animal subset
+```{r}
+plotdf_animal <- dd_animal %>% mutate(ParSex = factor(recode(ParSex, "F"="Female","M"="Male"), levels = c("Female", "Male")),
+         OffSex = factor(recode(OffSex, "F"="Female","M"="Male","Both"="Unspecified"), levels = c("Female", "Male","Unspecified")),
+         SpermProdSeason = factor(SpermProdSeason, levels = c("Seasonal", "Continuous")),
+         MethFact = factor(recode(MethFact, "qPCR"="qPCR","TRFSouthern"="TRF-SB","TRFInGel"="TRF-IG", "WGS"="WGS"), levels = c("qPCR","TRF-SB","TRF-IG","WGS")),
+         OffAgeTL = factor(OffAgeTL, levels = c("Adult", "Juvenile","Both")),
+         Tissue = factor(recode(Tissue,"Leucocytes"="Leucocytes","Erythrocytes"="Erythrocytes","Other"="Other"),
+                         levels = c("Leucocytes", "Erythrocytes","Other")),
+        # EnvCond = factor(EnvCond, levels = c("Wild", "Human")),
+         W_B_PEff = factor(W_B_PEff, levels = c("Within", "Between", "Neither")),
+         EnvEff = factor(recode(EnvEff,"Yes"="Accounted","No"="Not accounted"),levels = c("Accounted", "Not accounted")),
+         MF_ID = factor(recode(MF_ID,"Yes"="Accounted","No"="Not accounted"), levels = c("Accounted", "Not accounted")))
+
+# Unified moderators/fixed effects plot with facet_wrap
+plotdf_long_animal <- plotdf_animal %>% pivot_longer(cols = c(MethFact, Tissue, SpermProdSeason, OffSex, OffAgeTL, ParSex, EnvEff, W_B_PEff, MF_ID), names_to = "Category", values_to = "Value") %>% mutate(Category = factor(Category, levels = c("ParSex", "OffSex", "SpermProdSeason", "Tissue", "OffAgeTL", "MethFact", "W_B_PEff", "EnvEff", "MF_ID"))) %>% mutate(Value = factor(Value))
+
+# Manually add the missing row of OffSex Female count 0
+missing_offsex_female <- tibble(
+  Category = factor("OffSex", levels = levels(plotdf_long_animal$Category)),
+  Value = factor("Female", levels = levels(plotdf_long_animal$Value)))
+
+# Bind it only if it doesn’t already exist
+plotdf_long_animal <- plotdf_long_animal %>%
+  filter(!(Category == "OffSex" & Value == "Female")) %>%
+  bind_rows(missing_offsex_female)
+
+summary_counts <- plotdf_long_animal %>% count(Category, Value) %>% complete(Category = unique(plotdf_long_animal$Category),
+                                                                             Value = unique(plotdf_long_animal$Value),
+                                                                             fill = list(n = 0)) %>%
+  rename(Count = n) %>%
+  filter(Count > 0 | (Category == "OffSex" & Value == "Female")) %>%
+  mutate(Count = ifelse(Category == "OffSex" & Value == "Female", 0, Count))
+
+# faceted_moderators_comb_plot <- ggplot(plotdf_long_animal, aes(x = Value)) +
+#   facet_wrap(~ Category,
+#              labeller = labeller(Category = c("ParSex" = "(a) Parental sex",
+#                                               "OffSex" = "(b) Offspring sex",
+#                                               "SpermProdSeason" = "(c) Sperm production seasonality",
+#                                               "Tissue" = "(d) Cell type",
+#                                               "OffAgeTL" = "(e) Offspring age at measurement",
+#                                               "MethFact" = "(f) Laboratory method",
+#                                               "W_B_PEff" = "(g) Within-/between-parent effects",
+#                                               "EnvEff" = "(h) Parental environment effects",
+#                                               "MF_ID" = "(i) Parent's identity control")),
+#              nrow = 3, ncol = 3, scales = "free_x", strip.position = "top", axes = "margins", axis.labels = "all_x") + meta_theme + theme(strip.background = element_blank(),
+#                      strip.text = element_text(size = 12),
+#                      panel.spacing.x = unit(0.1, "cm"),
+#                      panel.spacing.y = unit(0.15, "cm"),
+#                      plot.margin = margin(0.1, 0.1, 0.1, 0.1, "cm")) + xlab("Levels of the fixed effects")
+
+meta_theme2 <- list(theme(panel.background = element_blank(),
+                          panel.grid.major = element_blank(),
+                          panel.grid.minor = element_blank(),
+                          panel.border = element_rect(colour = "black", fill=NA, size=1),
+                          axis.ticks = element_line(colour = "black"),
+                          axis.text.x = element_text(size = 10, colour = "black", margin = margin(t = 5)),
+                          axis.text.y = element_text(size = 10, colour = "black"),
+                          axis.title.x = element_text(size = 12, colour = "black", margin = margin(t = 20)), 
+                          axis.title.y = element_text(size = 12, colour = "black", margin = margin(r = 5))), 
+                          #axis.line = element_line(colour = "black"),
+                          geom_col(fill = "grey75", color = "black", width = 0.5),
+                          geom_text(aes(label = Count), size = 3, vjust = -0.5),
+                          scale_y_continuous(breaks = seq(0,140,20), limits = c(0,145), expand = c(0,0)),
+                          ylab("Frequency"))
+                   
+faceted_moderators_comb_plot <- ggplot(summary_counts, aes(x = Value, y = Count)) + facet_wrap(~ Category,
+             labeller = labeller(Category = c("ParSex" = "(a) Parental sex",
+                                              "OffSex" = "(b) Offspring sex",
+                                              "SpermProdSeason" = "(c) Sperm production seasonality",
+                                              "Tissue" = "(d) Cell type",
+                                              "OffAgeTL" = "(e) Offspring age at measurement",
+                                              "MethFact" = "(f) Laboratory method",
+                                              "W_B_PEff" = "(g) Within-/between-parent effects",
+                                              "EnvEff" = "(h) Parental environment effects",
+                                              "MF_ID" = "(i) Parent's identity controlled for")),
+             nrow = 3, ncol = 3, scales = "free_x", strip.position = "top") + meta_theme2 + theme(strip.background = element_blank(),
+                     strip.text = element_text(size = 12),
+                     panel.spacing.x = unit(0.1, "cm"),
+                     panel.spacing.y = unit(0.15, "cm"),
+                     plot.margin = margin(0.1, 0.1, 0.1, 0.1, "cm")) + xlab("Levels of the fixed effects")
+faceted_moderators_comb_plot
+
+# ggsave(faceted_moderators_comb_plot, filename = "faceted_moderators_comb_plot.png", bg = "white", width=30, height=30,  units = c("cm"))
+ggsave(faceted_moderators_comb_plot, filename = "faceted_moderators_comb_plot_animal.svg", bg = "white", width=30, height=30,  units = c("cm"))
+```
+
+## Combined plots with separate y-axis
+
+```{r}
+# parsex <- ggplot(plotdf, aes(ParSex)) + xlab("Parental sex") + meta_theme + labs(tag = "(c)") + theme(plot.margin = margin(0.05, 0.05, 1, 0.05, "cm"))
+# offsex <- ggplot(plotdf, aes(OffSex)) + xlab("Offspring sex") + meta_theme + labs(tag = "(d)") + theme(plot.margin = margin(0.05, 0.25, 1, 0.05, "cm"))
+# tissue <- ggplot(plotdf, aes(Tissue)) + xlab("Tissue") + meta_theme + labs(tag = "(e)") + theme(plot.margin = margin(0.05, 0.25, 1, 0.05, "cm"))
+# offage <- ggplot(plotdf, aes(OffAgeTL)) + xlab("Offspring age\nat measurement") + meta_theme + labs(tag = "(f)") + theme(plot.margin = margin(0.05, 0.05, 1, 0.25, "cm"))
+# method <- ggplot(plotdf, aes(MethFact)) + xlab("Laboratory method") + meta_theme + labs(tag = "(g)") + theme(plot.margin = margin(0.05, 0.05, 1, 0.05, "cm"))
+# 
+# season <- ggplot(plotdf, aes(SpermProdSeason)) + xlab("Sperm production\nseasonality") + meta_theme + labs(tag = "(h)") + theme(plot.margin = margin(0.05, 0.05, 0.05, 0.05, "cm"))
+# wb <- ggplot(plotdf, aes(W_B_PEff)) + xlab("Within-/between-parent\neffects") + meta_theme + labs(tag = "(i)") + theme(plot.margin = margin(0.05, 0.05, 0.05, 0.05, "cm"))
+# enveff <- ggplot(plotdf, aes(EnvEff)) + xlab("Environmental effects") + meta_theme + labs(tag = "(j)") + theme(plot.margin = margin(0.05, 0.05, 0.05, 0.05, "cm"))
+# # envcond <- ggplot(plotdf, aes(EnvCond)) + xlab("Environmental conditions") + meta_theme + labs(tag = "(k)") + theme(plot.margin = margin(0.05, 0.05, 0.05, 0.05, "cm"))
+# mfid <- ggplot(plotdf, aes(MF_ID)) + xlab("Parents' identity\ncontrol presence") + meta_theme + labs(tag = "(l)") + theme(plot.margin = margin(0.05, 0.05, 0.05, 0.05, "cm"))
+# 
+# # Combined plot
+# moderators_comb_plot <- ggarrange(parsex, offsex, tissue, offage, method, season, wb, enveff, mfid,
+#                                   align = "hv", ncol = 3, nrow = 3)
+# #ggsave(moderators_comb_plot, filename = "moderators_comb_plot.png", bg = "white", width=15*3, height=15*1.25, units = c("cm"))
+# ggsave(moderators_comb_plot, filename = "moderators_comb_plot.svg", bg = "white", width=30, height=30, units = c("cm"))
+
+# ggsave(method, filename = "method.png", bg = "white", width=15, height=15, units = c("cm"))
+# ggsave(tissue, filename = "tissue.png", bg = "white", width=15, height=15, units = c("cm"))
+# ggsave(offsex, filename = "offsex.png", bg = "white", width=15, height=15, units = c("cm"))
+# ggsave(offage, filename = "offage.png", bg = "white", width=15, height=15, units = c("cm"))
+# ggsave(parsex, filename = "parsex.png", bg = "white", width=15, height=15, units = c("cm"))
+# ggsave(wb, filename = "wb.png", bg = "white", width=15, height=15, units = c("cm"))
+# ggsave(envcond, filename = "envcond.png", bg = "white", width=15, height=15, units = c("cm"))
+# ggsave(enveff, filename = "enveff.png", bg = "white", width=15, height=15, units = c("cm"))
+# ggsave(mfid, filename = "mfid.png", bg = "white", width=15, height=15, units = c("cm"))
+
+```
+
+## Studies per year, effect estimates per year, species frequency
+
+```{r}
+# Species per effect estimate
+species_estimates <- ggplot(plotdf, aes(x=Species)) +
+  geom_bar(stat = "count", width = 0.5, colour = "black", fill = "grey75") +
+  geom_text(aes(label = after_stat(count)), stat = "count", size = 4, vjust = 0.5, hjust = -0.5) +
+  scale_y_continuous(breaks = seq(0,100,20), limits = c(0,105), expand = c(0,0)) +
+  xlab("Species per effect estimate") + ylab("Frequency") + labs(tag = "(a)") +
+  coord_flip() +
+  theme(plot.margin = margin(0.05, 0.05, 0.05, 0.05, "cm"),
+        
+        panel.background = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        
+        axis.ticks = element_line(colour = "black"),
+        axis.text.x = element_text(size = 12, colour = "black",margin = margin(t = 10)),
+        axis.text.y = element_text(size = 10, colour = "black", margin = margin(r = 5)),
+        axis.title.x = element_text(size = 12, colour = "black"), 
+        axis.title.y = element_text(size = 12, colour = "black", margin = margin(r = 5)), 
+        axis.line = element_line(colour = "black"))
+#ggsave(species_estimates, filename = "species_estimates.png", bg = "white", width=20, height=20*0.5, units = c("cm"))
+ggsave(species_estimates, filename = "species_estimates.svg", bg = "white", width=20, height=20*0.5, units = c("cm"))
+
+# Effect estimates per year (from studies) PER EACH YEAR, also empty years
+estimates_year <- ggplot(plotdf, aes(x=year)) +
+  geom_bar(stat = "count", width = 0.5, colour = "black", fill = "grey75") +
+  geom_text(aes(label = after_stat(count)), stat = "count", size = 4, vjust = -0.5) +
+  scale_y_continuous(breaks = seq(0,35,5), limits = c(0,35), expand = c(0,0)) +
+  xlab("Effect estimates per year") + ylab("Frequency") + labs(tag = "(b)") +
+  theme(plot.margin = margin(0.05, 0.05, 0.05, 0.05, "cm"),
+        panel.background = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        axis.ticks = element_line(colour = "black"),
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 10, colour = "black", margin = margin(t = 5)),
+        axis.text.y = element_text(size = 12, colour = "black"),
+        axis.title.x = element_text(size = 12, colour = "black", margin = margin(t = 15)), 
+        axis.title.y = element_text(size = 12, colour = "black", margin = margin(r = 10)), 
+        axis.line = element_line(colour = "black"))
+#ggsave(estimates_year, filename = "estimates_year.png", bg = "white", width=16, height=16*0.75, units = c("cm"))
+ggsave(estimates_year, filename = "estimates_year.svg", bg = "white", width=16, height=16*0.75, units = c("cm"))
+
+# Combined plot
+combined_study_species <- ggarrange(species_estimates, estimates_year,
+                                     align = "hv", nrow = 1, ncol = 2, widths = c(1.25,1))
+#ggsave(combined_study_species, filename = "combined_study_species.png", bg = "white", width=15*2.5, height=15*0.75, units = c("cm"))
+ggsave(combined_study_species, filename = "combined_study_species.svg", bg = "white", width=15*2.5, height=15*0.75, units = c("cm"))
+```
+
+```{r}
+###################
+# Studies per year
+d_year <- plotdf[!duplicated(plotdf$StudyID), ]
+study_year <- ggplot(d_year, aes(year)) + xlab("Studies per year") + ylab("Frequency") + #labs(tag = "(X)") +
+  geom_bar(stat = "count", width = 0.5, colour = "black", fill = "grey75") +
+  geom_text(aes(label = after_stat(count)), stat = "count", size = 4, vjust = -0.5) +
+  scale_y_continuous(breaks = seq(0,10,1), limits = c(0,8), expand = c(0,0)) +
+  theme(plot.margin = margin(0.5, 0.5, 0.5, 0.5, "cm"),
+        
+        panel.background = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        
+        axis.ticks = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 12, colour = "black", margin = margin(t = 5)),
+        axis.text.y = element_text(size = 12, colour = "black"),
+        axis.title.x = element_text(size = 12, colour = "black", margin = margin(t = 15)), 
+        axis.title.y = element_text(size = 12, colour = "black", margin = margin(r = 10)), 
+        axis.line = element_line(colour = "black"))
+#study_year
+
+# Species per study
+d_species <- plotdf[!duplicated(plotdf$StudyID), ] %>% group_by(Species)
+species_study <- ggplot(d_species, aes(Species)) +
+  geom_bar(stat = "count", width = 0.5, colour = "black", fill = "grey75") +
+  geom_text(aes(label = after_stat(count)), stat = "count", size = 4, vjust = -0.5) +
+  xlab("Species") + ylab("Count") +
+  scale_y_continuous(breaks = seq(0, 30, 10), limits = c(0, 35), expand = c(0, 0)) +
+  theme(plot.margin = margin(1, 0.05, 0.05, 3, "cm"),
+        panel.background = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        
+        axis.ticks = element_blank(),
+        axis.text.x = element_text(angle = 45, hjust = 1, size = 12, colour = "black", margin = margin(t = 5)),
+        axis.text.y = element_text(size = 12, colour = "black"),
+        axis.title.x = element_text(size = 12, colour = "black", margin = margin(t = 15)), 
+        axis.title.y = element_text(size = 12, colour = "black", margin = margin(r = 10)), 
+        axis.line = element_line(colour = "black"))
+#species_study
+```
+
+```{r}
+# Unused aterpillar plot
+# dd$caterpillar <- if_else(d$Species %in% c("Homo sapiens"), "Human", "Other")
+# m <- rma.mv(Zr,ZrVar,
+#             mods = ~caterpillar,
+#             random = list(~1|StudyID, ~1|Species, ~1|Phylogeny),
+#             R = list(Phylogeny = PhyloMatrix),
+#             method = "ML", data = dd, control = list(rel.tol = 1e-8)) # to avoid convergence problem
+# 
+# overall <- caterpillars(m,mod = "1", group = "Species",
+#                         xlab = "Fisher’s z-transformed correlation coefficients",
+#                         colerrorbar = "grey25", colpoint = "black", colpoly = "black",
+#                         overall = T,k = T,g = F)
+# overall + theme(
+#   axis.line.y = element_blank(),
+#   axis.line.x = element_line(colour = "black"),
+#   plot.background = element_blank(),
+#   panel.grid.major = element_blank(),
+#   panel.grid.minor = element_blank(),
+#   panel.border = element_blank())
+
+# grouped <- caterpillars(m,
+#                         mod = "caterpillar",
+#                         group = "caterpillar",
+#                         xlab = "Fisher’s z-transformed correlation coefficients",
+#                         colerrorbar = "grey25", colpoint = "black", colpoly = "black",
+#                         overall = T,k = T,g = F)
+# grouped + theme(
+#   axis.line.y = element_blank(),
+#   axis.line.x = element_line(colour = "black"),
+#   plot.background = element_blank(),
+#   panel.grid.major = element_blank(),
+#   panel.grid.minor = element_blank(),
+#   panel.border = element_blank())
+```
+
+
+# Supplement: m1 without StudyID
+
+```{r}
+m1S <- rma.mv(Zr, ZrVar, random = list(~1|EstimateID, ~1|Species, ~1|Phylogeny),
+                 R = list(Phylogeny = PhyloMatrix),
+                 data = dd, method = "ML")
+#summary(m1S)
+confint_m1S <- confint(m1S)
+confint_m1S
+# Heterogeneity proportion
+m1S.s2t <- sum(m1S$sigma2)+s2m
+m1SI2total <- sum(m1S$sigma2)/m1S.s2t
+m1SI2Estimate <- m1S$sigma2[1]/m1S.s2t
+m1SI2Species <- m1S$sigma2[2]/m1S.s2t
+m1SI2Phylogeny <- m1S$sigma2[3]/m1S.s2t
+m1SI2Resid <- s2m/m1S.s2t
+#LRT
+S_est = rma.mv(Zr,ZrVar, random = list(~1|Species, ~1|Phylogeny),R = list(Phylogeny = PhyloMatrix),method = "ML", data = dd)
+S_sp = rma.mv(Zr,ZrVar, random = list(~1|EstimateID, ~1|Phylogeny),R = list(Phylogeny = PhyloMatrix), method = "ML", data = dd)
+S_ph = rma.mv(Zr,ZrVar, random = list(~1|EstimateID, ~1|Species), method = "ML", data = dd)
+
+anova(m1S, S_est) # LRT for EstimateID - 408.9014 (<.0001)
+anova(m1S, S_sp) # LRT for Species - 0.5043 (0.4776)
+anova(m1S, S_ph) # LRT for Phylogeny - 0.7244 (0.3947)
+
+m1S_human <- rma.mv(Zr, ZrVar, random = ~1|EstimateID,
+                  data = dd[dd$SpeciesType == "Human",], method = "ML")
+# summary(m1S_human)
+confint_m1S_human <- confint(m1S_human)
+confint_m1S_human
+# Heterogeneity proportion
+m1S_human.s2t <- sum(m1S_human$sigma2)+s2m # total variance
+m1S_humanI2total <- sum(m1S_human$sigma2)/m1S_human.s2t
+m1S_humanI2Estimate <- m1S_human$sigma2[1]/m1S_human.s2t
+m1S_humanI2Resid <- s2m/m1S_human.s2t
+
+
+m1S_animal <- rma.mv(Zr, ZrVar, random = list(~1|EstimateID, ~1|Species, ~1|Phylogeny),R = list(Phylogeny = PhyloMatrix), method = "ML", data = dd[dd$SpeciesType == "Animal",],)
+# summary(m1S_animal)
+confint_m1S_animal <- confint(m1S_animal)
+confint_m1S_animal
+# Heterogeneity proportion
+m1S_animal.s2t <- sum(m1S_animal$sigma2)+s2m # total variance
+m1S_animalI2total <- sum(m1S_animal$sigma2)/m1S_animal.s2t
+m1S_animalI2Estimate <- m1S_animal$sigma2[1]/m1S_animal.s2t
+m1S_animalI2Species <- m1S_animal$sigma2[2]/m1S_animal.s2t
+m1S_animalI2Phylogeny <- m1S_animal$sigma2[3]/m1S_animal.s2t
+m1S_animalI2Resid <- s2m/m1S_animal.s2t
+
+anS_est = rma.mv(Zr,ZrVar, random = list(~1|Species, ~1|Phylogeny),R = list(Phylogeny = PhyloMatrix),method = "ML", data = dd[dd$SpeciesType == "Animal",],)
+anS_sp = rma.mv(Zr,ZrVar, random = list(~1|EstimateID, ~1|Phylogeny),R = list(Phylogeny = PhyloMatrix), method = "ML", data = dd[dd$SpeciesType == "Animal",],)
+anS_ph = rma.mv(Zr,ZrVar, random = list(~1|EstimateID, ~1|Species), method = "ML", data = dd[dd$SpeciesType == "Animal",],)
+
+anova(m1S_animal, anS_est) # LRT for EstimateID - 15.7115 (<0.0001)
+anova(m1S_animal, anS_sp) # LRT for Species - 1.1964 (0.2740)
+anova(m1S_animal, anS_ph) # LRT for Phylogeny - 0.0000 (1.0000)
+
+Smodels <- list(m1S, m1S_human, m1S_animal)
+options(modelsummary_get = "broom")
+
+m1S = modelsummary(
+  Smodels, shape = term ~ model + statistic, fmt = fmt_sprintf("%.4f"),
+  stars = c("*" = 0.05, "**" = 0.01, "***" = 0.001),
+  estimate = "{estimate} ({std.error})",
+  statistic = c("[{conf.low}, {conf.high}]", "{p.value} {stars}"),
+
+  gof_map = c("nobs", "aic","bic","logLik","aicc", "deviance", "df.residual"))
+m1S
+#save_tt(m1S, output = "m1S_summary.docx",overwrite=T)
+
+```
+
+# Supplement: full output of model with two interactions (one insignificant) - minsig
+
+```{r}
+## Overall
+# minsig <- rma.mv(Zr,ZrVar,
+#              mods = ~ ParSex*OffSex + Tissue*OffAgeTL + OffSex + ParSex + SpermProdSeason + EnvEff + MF_ID + W_B_PEff + OffAgeTL + MethFact + Tissue, random = list(~1|StudyID, ~1|EstimateID, ~1|Phylogeny), R = list(Phylogeny = PhyloMatrix),
+#              method = "ML", data = dd, control = list(rel.tol = 1e-8))
+# summary(minsig)
+# 
+# confint_minsig <- confint(minsig)
+# confint_minsig
+# 
+# # Heterogeneity proportion
+# minsig.s2t <- sum(minsig$sigma2)+s2m # total variance
+# minsigI2total <- sum(minsig$sigma2)/minsig.s2t
+# minsigI2Study <- minsig$sigma2[1]/minsig.s2t
+# minsigI2Estimate <- minsig$sigma2[2]/minsig.s2t
+# minsigI2Species <- minsig$sigma2[3]/minsig.s2t
+# minsigI2Phylogeny <- minsig$sigma2[4]/minsig.s2t
+# minsigI2Resid <- s2m/minsig.s2t
+
+### Subset into humans and animals
+
+# Human
+minsig_human <- rma.mv(Zr,ZrVar,
+             mods = ~ParSex*OffSex + Tissue*OffAgeTL + OffSex + ParSex + SpermProdSeason + EnvEff + MF_ID + W_B_PEff + OffAgeTL + MethFact + Tissue, random = list(~1|StudyID, ~1|EstimateID), method = "ML", data = dd[dd$SpeciesType == "Human",], control = list(rel.tol = 1e-8))
+summary(minsig_human)
+confint_minsig_human <- confint(minsig_human)
+confint_minsig_human
+# Heterogeneity proportion
+minsig_human.s2t <- sum(minsig_human$sigma2)+s2m # total variance
+minsig_humanI2total <- sum(minsig_human$sigma2)/minsig_human.s2t
+minsig_humanI2Study <- minsig_human$sigma2[1]/minsig_human.s2t
+minsig_humanI2Estimate <- minsig_human$sigma2[2]/minsig_human.s2t
+minsig_humanI2Resid <- s2m/minsig_human.s2t
+
+
+minsig_animal <- rma.mv(Zr,ZrVar,
+             mods = ~ParSex*OffSex + Tissue*OffAgeTL + OffSex + ParSex + SpermProdSeason + EnvEff + MF_ID + W_B_PEff + OffAgeTL + MethFact + Tissue, random = list(~1|StudyID, ~1|EstimateID, ~1|Phylogeny), R = list(Phylogeny = PhyloMatrix), method = "ML", data = dd[dd$SpeciesType == "Animal",], control = list(rel.tol = 1e-8))
+minsig_animal
+confint_minsig_animal <- confint(minsig_animal)
+confint_minsig_animal
+# Heterogeneity proportion
+minsig_animal.s2t <- sum(minsig_animal$sigma2)+s2m # total variance
+minsig_animalI2total <- sum(minsig_animal$sigma2)/minsig_animal.s2t
+minsig_animalI2Study <- minsig_animal$sigma2[1]/minsig_animal.s2t
+minsig_animalI2Estimate <- minsig_animal$sigma2[2]/minsig_animal.s2t
+minsig_animalI2Phylogeny <- minsig_animal$sigma2[3]/minsig_animal.s2t
+minsig_animalI2Resid <- s2m/minsig_animal.s2t 
+
+### Save
+models <- list()
+#models[['Model 3']] <- minsig
+models[['Model 3 - human subset']] <- minsig_human
+models[['Model 3 - animal subset']] <- minsig_animal
+
+options(modelsummary_get = "broom")
+
+minsigsummary = modelsummary(
+  models, shape = term ~ model + statistic, fmt = fmt_sprintf("%.4f"),
+  stars = c("*" = 0.05, "**" = 0.01, "***" = 0.001),
+  estimate = "{estimate} ({std.error})",
+  statistic = c("[{conf.low}, {conf.high}]", "{p.value} {stars}"),
+
+  gof_map = c("nobs", "aic","bic","logLik","aicc", "deviance", "df.residual"))
+minsigsummary
+save_tt(minsigsummary, output = "minsigsummary.docx",overwrite=T)
+```
+
+# Supplement: relevelled m2
+
+```{r}
+# releveled to male offspring ("M"), keep female parent ("F") dd$ParSex <- relevel(dd$ParSex, ref = "F")
+dd$OffSex <- relevel(dd$OffSex, ref = "M")
+# m2M <- rma.mv(Zr,ZrVar, mods = ~ParSex*OffSex + OffSex + ParSex+ SpermProdSeason + EnvEff + MF_ID + W_B_PEff + OffAgeTL + MethFact + Tissue, random = list(~1|StudyID, ~1|EstimateID, ~1|Species,~1|Phylogeny), R = list(Phylogeny = PhyloMatrix), method = "ML", data = dd, control = list(rel.tol = 1e-8), slab=paste(Author.s.))
+
+m2M_human <- rma.mv(Zr,ZrVar, mods = ~ParSex*OffSex + OffSex + ParSex + SpermProdSeason + EnvEff + MF_ID + W_B_PEff + OffAgeTL + MethFact + Tissue, random = list(~1|StudyID, ~1|EstimateID), method = "ML", data = dd[dd$SpeciesType == "Human",], control = list(rel.tol = 1e-8))
+
+m2M_animal <- rma.mv(Zr,ZrVar, mods = ~ParSex*OffSex + OffSex + ParSex + SpermProdSeason + EnvEff + MF_ID + W_B_PEff + OffAgeTL + MethFact + Tissue, random = list(~1|StudyID, ~1|EstimateID, ~1|Phylogeny), R = list(Phylogeny = PhyloMatrix), method = "ML", data = dd[dd$SpeciesType == "Animal",], control = list(rel.tol = 1e-8))
+
+models <- list(m2M_human, m2M_animal)
+options(modelsummary_get = "broom")
+
+m2Msummary = modelsummary(
+  models, shape = term ~ model + statistic, fmt = fmt_sprintf("%.4f"),
+  stars = c("*" = 0.05, "**" = 0.01, "***" = 0.001),
+  estimate = "{estimate} ({std.error})",
+  statistic = c("[{conf.low}, {conf.high}]", "{p.value} {stars}"),
+
+  gof_map = c("nobs", "aic","bic","logLik","aicc", "deviance", "df.residual"))
+m2Msummary
+save_tt(m2Msummary, output = "m2Msummary.docx",overwrite=T)
+```
+
+```{r}
+# releveled to unsegregated offspring ("Both"), keep female parent ("F") dd$ParSex <- relevel(dd$ParSex, ref = "F")
+dd$OffSex <- relevel(dd$OffSex, ref = "Both")
+# m2B <- rma.mv(Zr,ZrVar, mods = ~ParSex*OffSex + OffSex + ParSex+ SpermProdSeason + EnvEff + MF_ID + W_B_PEff + OffAgeTL + MethFact + Tissue, random = list(~1|StudyID, ~1|EstimateID, ~1|Species,~1|Phylogeny), R = list(Phylogeny = PhyloMatrix), method = "ML", data = dd, control = list(rel.tol = 1e-8), slab=paste(Author.s.))
+
+m2B_human <- rma.mv(Zr,ZrVar, mods = ~ParSex*OffSex + OffSex + ParSex + SpermProdSeason + EnvEff + MF_ID + W_B_PEff + OffAgeTL + MethFact + Tissue, random = list(~1|StudyID, ~1|EstimateID), method = "ML", data = dd[dd$SpeciesType == "Human",], control = list(rel.tol = 1e-8))
+
+m2B_animal <- rma.mv(Zr,ZrVar, mods = ~ParSex*OffSex + OffSex + ParSex + SpermProdSeason + EnvEff + MF_ID + W_B_PEff + OffAgeTL + MethFact + Tissue, random = list(~1|StudyID, ~1|EstimateID, ~1|Species,~1|Phylogeny),R = list(Phylogeny = PhyloMatrix), method = "ML", data = dd[dd$SpeciesType == "Animal",], control = list(rel.tol = 1e-8))
+
+models <- list(m2B_human, m2B_animal)
+options(modelsummary_get = "broom")
+
+m2Bsummary = modelsummary(
+  models, shape = term ~ model + statistic, fmt = fmt_sprintf("%.4f"),
+  stars = c("*" = 0.05, "**" = 0.01, "***" = 0.001),
+  estimate = "{estimate} ({std.error})",
+  statistic = c("[{conf.low}, {conf.high}]", "{p.value} {stars}"),
+
+  gof_map = c("nobs", "aic","bic","logLik","aicc", "deviance", "df.residual"))
+m2Bsummary
+save_tt(m2Bsummary, output = "m2Bsummary.docx",overwrite=T)
+```
